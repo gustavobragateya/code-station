@@ -19,9 +19,31 @@ struct WorkingTreeWatchTests {
         #expect(watch.hasInspected(path))
         #expect(watch.isDirty(path))
         #expect(watch.uncommittedFileCount(at: path) == 3)
+    }
+
+    @Test func readsATreeAgainOnlyAfterItChanges() async throws {
+        let folder = ScratchDirectory(prefix: "working-tree-watch")
+        let path = folder.url.path
+        let inspections = InspectionCount(result: 0)
+        let watch = WorkingTreeWatch { path in
+            await inspections.inspect(path)
+        }
 
         watch.refresh([path])
-        try await eventually { inspections.value == 2 }
+        try await eventually { inspections.value == 1 && watch.hasInspected(path) }
+
+        // Longer than the stream's one-second latency, so a stray event would have landed.
+        try await Task.sleep(for: .seconds(2))
+        watch.refresh([path])
+        watch.refresh([path])
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(inspections.value == 1)
+
+        try "new".write(to: folder.path("file.txt"), atomically: true, encoding: .utf8)
+        try await eventually {
+            watch.refresh([path])
+            return inspections.value == 2
+        }
     }
 
     @Test func noticesLinkedWorktreeEditsStagingCommitsAndDeletion() async throws {
