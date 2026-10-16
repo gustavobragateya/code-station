@@ -114,6 +114,9 @@ enum ClaudeSessionCatalog {
               // conversations anyone sat through, so they are not offered.
               !(reading.entrypoint?.hasPrefix("sdk") ?? false),
               reading.firstPrompt != nil || reading.title != nil,
+              // A session Claude never answered was opened and left, most often to type
+              // /resume and jump into another one. There is nothing in it to carry on.
+              reading.answered,
               let last = reading.lastTimestamp ?? modificationDate(of: file)
         else { return nil }
 
@@ -140,6 +143,7 @@ enum ClaudeSessionCatalog {
         var customTitle: String?
         var firstTimestamp: Date?
         var lastTimestamp: Date?
+        var answered = false
 
         mutating func take(_ object: [String: Any]) {
             if cwd == nil, let value = object["cwd"] as? String, !value.isEmpty { cwd = value }
@@ -158,6 +162,8 @@ enum ClaudeSessionCatalog {
                 if firstPrompt == nil, let prompt = ClaudeTranscriptImport.prompt(in: object) {
                     firstPrompt = prompt
                 }
+            case "assistant":
+                if object["isSidechain"] as? Bool != true { answered = true }
             default:
                 break
             }

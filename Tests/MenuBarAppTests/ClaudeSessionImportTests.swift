@@ -158,21 +158,30 @@ struct ClaudeSessionCatalogTests {
             History.line(["type": "custom-title", "customTitle": "my name", "sessionId": "s"]),
             History.prompt("question"),
             History.line(["type": "ai-title", "aiTitle": "Generated", "sessionId": "s"]),
+            History.assistant([History.text("ok")]),
         ])
 
         #expect(ClaudeSessionCatalog.sessions(in: "/work/app", root: scratch.url).first?.displayTitle == "my name")
     }
 
     @Test func otherFoldersAndSubfoldersAreLeftOut() throws {
-        try write([History.prompt("elsewhere", cwd: "/work/other")], folder: "-work-other")
-        try write([History.prompt("deeper", cwd: "/work/app/Sources")], folder: "-work-app-Sources")
+        try write([History.prompt("elsewhere", cwd: "/work/other"), History.assistant([History.text("ok")])],
+                  folder: "-work-other")
+        try write([History.prompt("deeper", cwd: "/work/app/Sources"), History.assistant([History.text("ok")])],
+                  folder: "-work-app-Sources")
+
+        #expect(ClaudeSessionCatalog.sessions(in: "/work/app", root: scratch.url).isEmpty)
+    }
+
+    @Test func aSessionClaudeNeverAnsweredIsLeftOut() throws {
+        try write([History.prompt("<command-name>/resume</command-name>")])
 
         #expect(ClaudeSessionCatalog.sessions(in: "/work/app", root: scratch.url).isEmpty)
     }
 
     @Test func conversationsTheAppAlreadyHoldsAreLeftOut() throws {
-        let kept = try write([History.prompt("new one")])
-        let known = try write([History.prompt("already here")])
+        let kept = try write([History.prompt("new one"), History.assistant([History.text("ok")])])
+        let known = try write([History.prompt("already here"), History.assistant([History.text("ok")])])
 
         let found = ClaudeSessionCatalog.sessions(in: "/work/app", excluding: [known], root: scratch.url)
 
@@ -180,7 +189,8 @@ struct ClaudeSessionCatalogTests {
     }
 
     @Test func scriptedRunsAndEmptyFilesAreLeftOut() throws {
-        try write([History.prompt("from a script", extra: ["entrypoint": "sdk-cli"])])
+        try write([History.prompt("from a script", extra: ["entrypoint": "sdk-cli"]),
+                   History.assistant([History.text("ok")])])
         try write([History.line(["type": "mode", "mode": "normal", "cwd": "/work/app"])])
         try write([])
 
@@ -188,8 +198,10 @@ struct ClaudeSessionCatalogTests {
     }
 
     @Test func newestComeFirst() throws {
-        let old = try write([History.prompt("old", at: "2026-09-01T10:00:00.000Z")])
-        let new = try write([History.prompt("new", at: "2026-10-01T10:00:00.000Z")])
+        let old = try write([History.prompt("old", at: "2026-09-01T10:00:00.000Z"),
+                             History.assistant([History.text("ok")], at: "2026-09-01T10:00:05.000Z")])
+        let new = try write([History.prompt("new", at: "2026-10-01T10:00:00.000Z"),
+                             History.assistant([History.text("ok")], at: "2026-10-01T10:00:05.000Z")])
 
         #expect(ClaudeSessionCatalog.sessions(in: "/work/app", root: scratch.url).map(\.id) == [new, old])
     }
