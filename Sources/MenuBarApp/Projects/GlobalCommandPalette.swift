@@ -166,7 +166,7 @@ struct GlobalCommandPalette: View {
     let openSettings: () -> Void
 
     @State private var query = ""
-    @State private var category = GlobalCommandCategory.all
+    @State private var category = GlobalCommandCategory.projects
     @State private var selected: GlobalCommandDestination?
     // Kept apart from `selected` because hover must not scroll: scrolling slides
     // another row under the mouse, which would hover it and scroll again.
