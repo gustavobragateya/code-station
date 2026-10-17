@@ -224,7 +224,7 @@ struct ReviewCommentCard: View {
 
 // Where a comment is written, opened right under the lines it is about. A new one is
 // either a question, answered here by a side copy and never sent, or a change, which
-// waits in the review for the agent. The band, the hint and the button all say which.
+// goes to the agent at once. The band, the hint and the button all say which.
 struct ReviewComposer: View {
     @Binding var text: String
     @Binding var kind: ReviewComment.Kind
@@ -275,13 +275,13 @@ struct ReviewComposer: View {
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(asks ? Theme.plan : Theme.accent)
                         .padding(.top, 1)
-                    Text(asks ? questionHint : "Waits in your review with any others. \(agentTitle) gets them all in one message when you send.")
+                    Text(asks ? questionHint : "Goes to \(agentTitle) in the chat as soon as you send it.")
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
                 HStack(spacing: 14) {
                     HStack(spacing: 4) {
-                        KeyCap(key: "⌘↩"); Text(asks ? "ask" : "add")
+                        KeyCap(key: "⌘↩"); Text(asks ? "ask" : "send")
                         Text("·"); KeyCap(key: "esc"); Text("cancel")
                         Text("· shift-click a number to cover more lines").lineLimit(1)
                     }
@@ -289,8 +289,8 @@ struct ReviewComposer: View {
                     .accessibilityHidden(true)
                     Spacer(minLength: 0)
                     InlineLink(title: "Cancel", tint: Color.secondary, action: onCancel)
-                    ActionButton(title: asks ? "Ask" : "Add to review", tone: asks ? .plan : .green, height: 28, size: 12,
-                                 icon: asks ? "questionmark" : "pencil",
+                    ActionButton(title: asks ? "Ask" : "Send", tone: asks ? .plan : .green, height: 28, size: 12,
+                                 icon: asks ? "questionmark" : "paperplane",
                                  keyboardShortcut: KeyboardShortcut(.return, modifiers: .command), action: save)
                         .disabled(text.isBlank)
                 }

@@ -2282,12 +2282,11 @@ struct ChangesView: View {
             focusedComment = question.id
             announce("Asked. The answer appears under the lines and stays here.")
         } else {
-            review.reviews.add(ReviewComment(root: repoRoot, path: draft.path, anchor: draft.anchor,
-                                             excerpt: draft.excerpt, body: draft.text.trimmed,
-                                             excerptOffsets: draft.excerptOffsets, kind: draft.kind),
-                               to: review.sessionID)
             commentDraft = nil
-            announce("Added to your review")
+            sendChange(ReviewComment(root: repoRoot, path: draft.path, anchor: draft.anchor,
+                                     excerpt: draft.excerpt, body: draft.text.trimmed,
+                                     excerptOffsets: draft.excerptOffsets, kind: draft.kind),
+                       review: review)
         }
     }
 
@@ -2799,8 +2798,8 @@ struct ChangesView: View {
                   action: "Open Chat", perform: review.openChat)
     }
 
-    // A change made from an answer goes on its own, at once, as a round of its own. The
-    // rest of the review stays where it is.
+    // A new change goes on its own, at once, as a round of its own. The rest of the
+    // review stays where it is.
     private func sendChange(_ change: ReviewComment, review: ReviewTarget) {
         let prompt = ReviewPrompt.feedback([change], projectNames: projectNames, note: "")
         let busy = review.isBusy()
