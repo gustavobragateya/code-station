@@ -369,7 +369,9 @@ struct ChangesView: View {
                         .onTapGesture { showsPicker = false }
                 }
             }
-            if let review, mode == .changes, !files.isEmpty || !review.reviews.comments(review.sessionID).isEmpty {
+            if let review, mode == .changes,
+               !files.isEmpty || !review.reviews.comments(review.sessionID).isEmpty
+                || !review.reviews.rounds(review.sessionID).isEmpty {
                 reviewStrip(review)
                     .overlay(alignment: .topTrailing) {
                         if showsPicker {
@@ -702,12 +704,14 @@ struct ChangesView: View {
         VStack(spacing: 0) {
             if mode == .history { historyFilterField }
             if mode == .changes, let review {
-                let count = review.reviews.comments(review.sessionID).count
+                let open = review.reviews.threads(review.sessionID).count { !$0.round.resolved.contains($0.comment.id) }
+                let count = review.reviews.comments(review.sessionID).count + open
                 let pending = !review.reviews.pending(review.sessionID).isEmpty
+                let unread = review.reviews.unreadCount(review.sessionID) > 0
                 HStack(spacing: 4) {
                     ChoicePill(title: "Files \(navigatorFileCount)", selected: !showingReview) { showingReview = false }
                     ChoicePill(title: count > 0 ? "Review \(count)" : "Review", selected: showingReview,
-                               dot: pending ? Theme.attention : nil) { showingReview = true }
+                               dot: pending ? Theme.attention : unread ? Theme.plan : nil) { showingReview = true }
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
@@ -1259,6 +1263,8 @@ struct ChangesView: View {
 
                 if let review {
                     let comments = review.reviews.comments(review.sessionID, root: repoRoot, path: file.path)
+                        + review.reviews.threads(review.sessionID, root: repoRoot, path: file.path)
+                            .filter { !$0.round.resolved.contains($0.comment.id) }.map(\.comment)
                     if !comments.isEmpty {
                         let pending = comments.contains(where: \.isPending)
                         HStack(spacing: 3) {
@@ -1932,6 +1938,18 @@ struct ChangesView: View {
         return ReviewPlacement.place(openFileComments, in: diff.lines)
     }
 
+    // Sent comments stay under their lines as threads. One whose code has left the diff
+    // is still in the review list, so it is not listed again above the diff.
+    private var openFileThreads: [(round: ReviewRound, comment: ReviewComment)] {
+        guard let review, let file = selected else { return [] }
+        return review.reviews.threads(review.sessionID, root: repoRoot, path: file.path)
+    }
+
+    private var sentPlacement: ReviewPlacement {
+        guard let diff else { return ReviewPlacement() }
+        return ReviewPlacement.place(openFileThreads.map(\.comment), in: diff.lines)
+    }
+
     private var pickedKeys: Set<String> {
         commentDraft.map { DiffComments.keys($0.anchor) } ?? []
     }
@@ -1950,8 +1968,8 @@ struct ChangesView: View {
 
     // The lines a thread hangs from: those with comments placed under them, and the one a
     // comment is being written about.
-    private func threadLines(placement: ReviewPlacement, lines: [DiffLine]) -> Set<Int> {
-        var ids = Set(placement.below.keys)
+    private func threadLines(placement: ReviewPlacement, sent: ReviewPlacement, lines: [DiffLine]) -> Set<Int> {
+        var ids = Set(placement.below.keys).union(sent.below.keys)
         if let draft = commentDraft, draft.path == selected?.path, draft.editing == nil,
            let id = lineID(for: draft.anchor, in: lines) {
             ids.insert(id)
@@ -1961,13 +1979,15 @@ struct ChangesView: View {
 
     private var threadLineIDs: Set<Int> {
         guard review != nil, mode == .changes, let diff else { return [] }
-        return threadLines(placement: placement, lines: diff.lines)
+        return threadLines(placement: placement, sent: sentPlacement, lines: diff.lines)
     }
 
     private func diffComments(for file: GitChange?, lines: [DiffLine]) -> DiffComments? {
         guard let review else { return nil }
         let comments = file.map { review.reviews.comments(review.sessionID, root: repoRoot, path: $0.path) } ?? []
-        return DiffComments(threads: threadLines(placement: ReviewPlacement.place(comments, in: lines), lines: lines))
+        let sent = file.map { review.reviews.threads(review.sessionID, root: repoRoot, path: $0.path).map(\.comment) } ?? []
+        return DiffComments(threads: threadLines(placement: ReviewPlacement.place(comments, in: lines),
+                                                 sent: ReviewPlacement.place(sent, in: lines), lines: lines))
     }
 
     // What hangs under each line: its cards, and the composer where one is being written.
@@ -1975,6 +1995,8 @@ struct ChangesView: View {
     private func threadViews(_ review: ReviewTarget) -> [Int: AnyView] {
         guard let diff else { return [:] }
         let placement = placement
+        let sent = sentPlacement
+        let rounds = Dictionary(openFileThreads.map { ($0.comment.id, $0.round) }, uniquingKeysWith: { first, _ in first })
         var views: [Int: AnyView] = [:]
         let draftLine: Int? = {
             guard let draft = commentDraft, draft.path == selected?.path else { return nil }
@@ -1983,9 +2005,13 @@ struct ChangesView: View {
             }
             return lineID(for: draft.anchor, in: diff.lines)
         }()
-        for id in threadLines(placement: placement, lines: diff.lines) {
+        for id in threadLines(placement: placement, sent: sent, lines: diff.lines) {
             let comments = placement.below[id] ?? []
+            let threads = (sent.below[id] ?? []).compactMap { comment in rounds[comment.id].map { ($0, comment) } }
             views[id] = AnyView(VStack(alignment: .leading, spacing: 8) {
+                ForEach(threads, id: \.1.id) { round, comment in
+                    thread(comment, round: round, review: review)
+                }
                 ForEach(comments) { comment in
                     if commentDraft?.editing == comment.id {
                         composer(review)
@@ -2002,8 +2028,43 @@ struct ChangesView: View {
     private var revealedLine: DiffReveal? {
         guard let focusedComment,
               let line = placement.below.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
+                ?? sentPlacement.below.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
         else { return nil }
         return DiffReveal(line: line, serial: revealSerial)
+    }
+
+    private func thread(_ comment: ReviewComment, round: ReviewRound, review: ReviewTarget) -> some View {
+        let focused = focusedComment == comment.id
+        return ReviewThreadView(
+            round: round, comment: comment, agent: review.agent, fileName: fileLabel(comment),
+            working: review.isBusy(), showsQuote: false, focused: focused,
+            projectPath: repoRoot, textScale: appSettings.textSize.scale,
+            reply: { replyInThread($0, to: comment, round: round, review: review) },
+            resolve: {
+                review.reviews.resolve(comment.id, round: round.id, in: review.sessionID)
+                announce("Resolved")
+            },
+            reopen: { review.reviews.reopen(comment.id, round: round.id, in: review.sessionID) })
+            .padding(.bottom, 2)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(focused ? Theme.accent : Theme.border, lineWidth: focused ? 2 : 1))
+            .onTapGesture {
+                focusedComment = comment.id
+                review.reviews.markRead(comment.id, in: review.sessionID)
+            }
+    }
+
+    // A reply goes to the agent at once, as a turn of its own about those lines.
+    private func replyInThread(_ text: String, to comment: ReviewComment, round: ReviewRound, review: ReviewTarget) {
+        let names = projectNames
+        Task {
+            guard let prompt = await review.reviews.reply(text, to: comment.id, round: round.id, in: review.sessionID,
+                                                          projectNames: names) else { return }
+            let busy = review.isBusy()
+            review.send(prompt)
+            announce(busy ? "Reply queued for \(review.agent.title)" : "Reply sent to \(review.agent.title)")
+        }
     }
 
     private func card(_ comment: ReviewComment, review: ReviewTarget, showsLines: Bool = true) -> some View {
@@ -2148,6 +2209,7 @@ struct ChangesView: View {
     private func focus(_ comment: ReviewComment) {
         focusedComment = comment.id
         revealSerial += 1
+        review?.reviews.markRead(comment.id, in: review?.sessionID ?? UUID())
         if commentDraft?.editing != nil || commentDraft?.text.isBlank != false { commentDraft = nil }
         guard comment.root == repoRoot else {
             selectRepository(comment.root, comment.path)
@@ -2335,12 +2397,25 @@ struct ChangesView: View {
         let fileCount = Set(kept.map { $0.root + "/" + $0.path }).count
         let settled = settledComments(all)
         let unplaced = placement.unplaced.count
+        let sent = review.reviews.threads(review.sessionID).count
+        let unread = review.reviews.unreadCount(review.sessionID)
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Label("Your review", systemImage: "text.bubble.fill")
                     .font(.system(size: 12, weight: .semibold))
                     .labelStyle(ReviewBarLabelStyle())
                 HStack(spacing: 8) {
+                    if unread > 0 {
+                        Button(action: nextUnread) {
+                            Text(unread == 1 ? "1 reply to read" : "\(unread) replies to read")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(Theme.plan)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .appTooltip("Open the next reply")
+                    }
+                    if sent > 0 { Text("\(sent) sent").lineLimit(1) }
                     Text(!kept.isEmpty ? "\(counted(kept.count, "comment")) on \(counted(fileCount, "file"))"
                          : all.isEmpty ? "Click a line number, or drag down several, to comment" : "Nothing kept yet")
                         .lineLimit(1)
@@ -2388,7 +2463,8 @@ struct ChangesView: View {
             if !all.isEmpty {
                 InlineLink(title: "Clear", tint: Color.secondary) { confirmClear(review, kept: kept.count, pending: pending) }
             }
-            ActionButton(title: "Send to \(review.agent.title)" + (kept.isEmpty ? "" : "  \(kept.count)"),
+            ActionButton(title: kept.isEmpty ? "Send to \(review.agent.title)"
+                         : "Send \(counted(kept.count, "comment")) to \(review.agent.title)",
                          tone: .green, height: 28, size: 12, icon: "paperplane.fill") { previewSend(review) }
                 .disabled(kept.isEmpty)
         }
@@ -2396,6 +2472,15 @@ struct ChangesView: View {
         .padding(.horizontal, 20).padding(.vertical, 8)
         .background(Theme.card)
         .overlay(alignment: .top) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+    }
+
+    // The first thread with an answer not yet read, in the order the review list shows.
+    private func nextUnread() {
+        guard let review,
+              let next = review.reviews.threads(review.sessionID).first(where: { $0.round.unread.contains($0.comment.id) })
+        else { return }
+        showingReview = true
+        focus(next.comment)
     }
 
     // A file that has been committed or reverted leaves the list, and its comments with
@@ -2575,6 +2660,7 @@ struct ChangesView: View {
         let running = runs.filter(\.isRunning)
         let emptyRun = runs.first { if case .finished(0) = $0.state { true } else { false } }
         let list = all.filter(reviewFilter.admits)
+        let threads = review.reviews.threads(review.sessionID)
         VStack(alignment: .leading, spacing: 8) {
             FlowRow(spacing: 4) {
                 filterPill("All", .all, count: all.count)
@@ -2608,7 +2694,7 @@ struct ChangesView: View {
                             }
                         }
                         if !pending.isEmpty { findingsSummary(pending, review: review) }
-                        if list.isEmpty && running.isEmpty && emptyRun == nil {
+                        if list.isEmpty && threads.isEmpty && running.isEmpty && emptyRun == nil {
                             VStack(spacing: 6) {
                                 if reviewFilter == .pending {
                                     Image(systemName: "checkmark").foregroundStyle(Theme.dotOn)
@@ -2622,6 +2708,9 @@ struct ChangesView: View {
                             .font(.system(size: 11.5)).foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: .infinity).padding(.vertical, 24).padding(.horizontal, 12)
+                        }
+                        if !threads.isEmpty, !list.isEmpty {
+                            groupHeader("Not sent yet", count: list.count)
                         }
                         ForEach(Array(list.enumerated()), id: \.element.id) { index, comment in
                             if index == 0 || ReviewRound.fileKey(root: list[index - 1].root, path: list[index - 1].path)
@@ -2637,6 +2726,13 @@ struct ChangesView: View {
                             reviewItem(comment)
                                 .id(comment.id)
                         }
+                        if !threads.isEmpty {
+                            groupHeader("Sent to \(review.agent.title)", count: threads.count)
+                            ForEach(threads.reversed(), id: \.comment.id) { round, comment in
+                                threadItem(comment, round: round, agent: review.agent)
+                                    .id(comment.id)
+                            }
+                        }
                     }
                     .padding(10)
                 }
@@ -2645,6 +2741,51 @@ struct ChangesView: View {
                 }
             }
         }
+    }
+
+    private func groupHeader(_ title: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+            Spacer(minLength: 0)
+            Text("\(count)").font(.system(size: 11)).foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 6).padding(.top, 8)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    // A sent comment in the list: where it is, where it stands, and the last word on it.
+    private func threadItem(_ comment: ReviewComment, round: ReviewRound, agent: AgentKind) -> some View {
+        let isFocused = focusedComment == comment.id
+        let unread = round.unread.contains(comment.id)
+        let status = round.status(comment.id)
+        let last = round.replies(comment.id).last
+        let lines = comment.onFile ? "" : comment.lastLine.map { "\(comment.line)–\($0)" } ?? "\(comment.line)"
+        return Button { focus(comment) } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    if unread { Circle().fill(Theme.plan).frame(width: 6, height: 6) }
+                    (Text(fileLabel(comment)).foregroundStyle(.primary).fontWeight(.medium) + Text(" " + lines))
+                        .font(.mono(10.5)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    ReviewStatusChip(status: status)
+                }
+                ReviewText(text: comment.body, size: 12, lineLimit: 1)
+                if let last, !last.body.isBlank {
+                    Text((last.author == .agent ? agent.title : "You") + ": " + last.body)
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isFocused ? Theme.accent.opacity(0.08) : .clear))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(isFocused ? Theme.accent.opacity(0.3) : .clear))
+            .opacity(status == .resolved ? 0.7 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .hoverFill(cornerRadius: 8)
+        .accessibilityLabel(ReviewThreadView.spokenName(status: status, comment: comment,
+                                                        fileName: fileLabel(comment), unread: unread))
+        .accessibilityAddTraits(isFocused ? .isSelected : [])
     }
 
     private func filterPill(_ title: String, _ filter: ReviewFilter, count: Int) -> some View {

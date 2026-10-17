@@ -239,6 +239,16 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // The message with its text ending at `offset`, for when the rest is shown elsewhere.
+    // Calls made after that point stay, drawn after what is left.
+    func cut(at offset: Int) -> ChatMessage {
+        var copy = self
+        var kept = text.prefix(max(0, offset))
+        while kept.last?.isWhitespace == true { kept.removeLast() }
+        copy.text = String(kept)
+        return copy
+    }
+
     var isEmpty: Bool {
         text.isBlank
             && tools.isEmpty

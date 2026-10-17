@@ -611,9 +611,6 @@ struct SendReviewSheet: View {
                     .appTextField()
             }
             HStack(spacing: 14) {
-                Text("Sent comments leave the review. You can follow them up in Chat.")
-                    .font(.system(size: 11.5)).foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
                 Button { dialogs.dismiss() } label: {
                     Text("Cancel").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
@@ -701,193 +698,485 @@ struct ReviewToastView: View {
     }
 }
 
-// MARK: - In Chat
+// MARK: - Threads
 
-// A sent review as it sits in the conversation: one card listing what went, instead of
-// the long prompt the agent read.
-struct ReviewRoundCard: View {
-    let round: ReviewRound
-    let fileName: (ReviewComment) -> String
-    let openInChanges: () -> Void
+// Where a sent comment stands, in a word and an icon so it never rests on colour.
+struct ReviewStatusChip: View {
+    let status: ReviewRound.Status
+    var label: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                ReviewAvatar(agent: nil, size: 22)
-                Text("Your review").font(.serif(14, .semibold))
-                let raised = round.comments.count { $0.reviewer != nil }
-                Text(counted(round.comments.count, "comment") + (raised > 0 ? " · \(raised) raised by reviewers" : ""))
-                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-                InlineLink(title: "Open in Changes", size: 11.5, action: openInChanges)
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(round.comments.enumerated()), id: \.element.id) { index, comment in
-                    HStack(spacing: 8) {
-                        Text("\(index + 1).").font(.mono(10.5)).foregroundStyle(.tertiary)
-                        Text(ReviewFollowUpCard.place(comment, fileName: fileName))
-                            .font(.mono(10.5)).foregroundStyle(.secondary).lineLimit(1).fixedSize()
-                        ReviewAvatars(comment: comment, size: 16)
-                        if comment.kind == .question { QuestionTag() }
-                        ReviewText(text: comment.body, size: 12, lineLimit: 1)
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9, weight: .bold))
+            Text(label ?? status.label).lineLimit(1).fixedSize()
+        }
+        .font(.system(size: 11, weight: .semibold))
+        .foregroundStyle(ink)
+        .padding(.horizontal, status == .resolved ? 0 : 8).padding(.vertical, 3)
+        .background(Capsule().fill(fill))
+    }
+
+    private var icon: String {
+        switch status {
+        case .waiting: "clock"
+        case .answered: "bubble.left"
+        case .changed, .resolved: "checkmark"
+        case .unchanged: "minus"
+        }
+    }
+
+    private var ink: Color {
+        switch status {
+        case .waiting: Color.secondary
+        case .answered: Theme.plan
+        case .changed: Theme.dotOnText
+        case .unchanged: Theme.attentionText
+        case .resolved: Color.secondary.opacity(0.7)
+        }
+    }
+
+    private var fill: Color {
+        switch status {
+        case .waiting: Theme.field
+        case .answered: Theme.plan.opacity(0.12)
+        case .changed: Theme.dotOn.opacity(0.14)
+        case .unchanged: Theme.attention.opacity(0.14)
+        case .resolved: .clear
+        }
+    }
+}
+
+// A sent comment as a thread: its file and lines, the code it quotes, the comment, the
+// agent's answer and every reply after. Chat and Changes draw the same one, so a thread
+// reads the same wherever it is opened.
+struct ReviewThreadView: View {
+    let round: ReviewRound
+    let comment: ReviewComment
+    let agent: AgentKind
+    let fileName: String
+    // The turn that took the review is still running, so no answer is in yet.
+    var working = false
+    // Changes draws the thread right under its lines, which already show the code.
+    var showsQuote = true
+    var focused = false
+    var projectPath = ""
+    var textScale: CGFloat = 1
+    let reply: (String) -> Void
+    let resolve: () -> Void
+    let reopen: () -> Void
+    var showInDiff: (() -> Void)?
+
+    @State private var replying = false
+    @State private var draft = ""
+    @State private var showsAllLines = false
+    @FocusState private var fieldFocused: Bool
+
+    private var status: ReviewRound.Status {
+        working && !round.isSettled && !round.resolved.contains(comment.id) ? .waiting : round.status(comment.id)
+    }
+
+    private var replies: [ReviewReply] { round.replies(comment.id) }
+
+    private var lines: String {
+        comment.onFile ? "" : comment.lastLine.map { "\(comment.line)–\($0)" } ?? "\(comment.line)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            bar
+            if status != .resolved {
+                if showsQuote, !comment.excerpt.isBlank { quote.padding(.horizontal, 16).padding(.top, 8) }
+                VStack(alignment: .leading, spacing: 12) {
+                    message(agent: nil, when: nil) {
+                        ReviewText(text: comment.body, size: 13)
                     }
-                    .accessibilityElement(children: .combine)
+                    if replies.first?.author != .agent { firstAnswer }
+                    ForEach(replies) { reply in
+                        if reply.author == .you {
+                            message(agent: nil, when: Text(reply.sent, format: .relative(presentation: .named))) {
+                                ReviewText(text: reply.body, size: 13)
+                            }
+                        } else {
+                            agentReply(reply)
+                        }
+                    }
+                    if round.isAwaitingReply(comment.id) {
+                        message(agent: agent, when: Text("replying")) {
+                            ProgressView().controlSize(.small).padding(.vertical, 2)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 14)
+                if replying { replyBox }
+                if status != .waiting { actions }
+            }
+        }
+        .background(focused ? Theme.accent.opacity(0.05) : .clear)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Self.spokenName(status: status, comment: comment, fileName: fileName,
+                                            unread: round.unread.contains(comment.id)))
+    }
+
+    static func spokenName(status: ReviewRound.Status, comment: ReviewComment, fileName: String, unread: Bool) -> String {
+        let place = comment.onFile ? "\(fileName), whole file"
+            : comment.lastLine.map { "\(fileName) lines \(comment.line) to \($0)" } ?? "\(fileName) line \(comment.line)"
+        return "\(status.label), \(place), \(comment.body)" + (unread ? ", new reply" : "")
+    }
+
+    private var bar: some View {
+        HStack(spacing: 10) {
+            (Text(fileName).foregroundStyle(.primary).fontWeight(.medium) + Text(lines.isEmpty ? "" : " " + lines))
+                .font(.mono(11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            if status == .resolved {
+                ReviewText(text: comment.body, size: 12, lineLimit: 1)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 420, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+            ReviewStatusChip(status: status)
+            if status == .resolved {
+                InlineLink(title: "Reopen", size: 11.5, tint: Color.secondary, action: reopen)
+            }
+        }
+        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, status == .resolved ? 12 : 0)
+    }
+
+    // The quoted code: three lines, with the rest a click away.
+    private var quote: some View {
+        let code = comment.excerpt.components(separatedBy: "\n")
+        let offsets = comment.excerptOffsets ?? Array(code.indices)
+        let numbered = zip(offsets, code).map { (number: comment.line + $0, code: $1) }
+        let shown = showsAllLines ? numbered : Array(numbered.prefix(3))
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(shown, id: \.number) { line in
+                codeLine(number: line.number, text: line.code, ink: .secondary,
+                         numberInk: Theme.attentionText, fill: Theme.brand.opacity(0.22))
+            }
+            if numbered.count > shown.count {
+                Button { showsAllLines = true } label: {
+                    Text("Show all \(numbered.count) lines")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                        .padding(.leading, 52).padding(.vertical, 3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .overlay(alignment: .top) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+            }
+        }
+        .codeBox()
+    }
+
+    private func codeLine(number: Int, text: String, ink: Color, numberInk: Color, fill: Color) -> some View {
+        HStack(spacing: 12) {
+            Text("\(number)").foregroundStyle(numberInk).frame(width: 28, alignment: .trailing)
+            Text(text).foregroundStyle(ink).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .font(.mono(11))
+        .padding(.vertical, 1.5)
+        .padding(.trailing, 12)
+        .background(fill)
+    }
+
+    // The agent's first word on the comment, or where it will go while the turn runs.
+    @ViewBuilder private var firstAnswer: some View {
+        if !round.isSettled {
+            message(agent: agent, when: Text("working on it")) {
+                VStack(alignment: .leading, spacing: 7) {
+                    RoundedRectangle(cornerRadius: 5).fill(Theme.field).frame(width: 280, height: 9)
+                    RoundedRectangle(cornerRadius: 5).fill(Theme.field).frame(width: 190, height: 9)
+                }
+                .padding(.top, 4)
+                .accessibilityLabel("\(agent.title) is working on it")
+            }
+        } else {
+            message(agent: agent, when: Text(firstWhen(changedFile: round.outcomes?[comment.id] == .changed))) {
+                Text("No answer of its own. What \(agent.title) said is in the conversation.")
+                    .font(.system(size: 12.5)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func firstWhen(changedFile: Bool) -> String {
+        switch round.outcomes?[comment.id] {
+        case .answered: changedFile ? "answered · changed the file" : "answered · no files changed"
+        case .changed: "changed the file"
+        case .unchanged: "left it as it is"
+        case nil: "answered"
+        }
+    }
+
+    private func agentReply(_ reply: ReviewReply) -> some View {
+        let first = replies.first?.id == reply.id
+        let when = first ? firstWhen(changedFile: reply.changedFile) : reply.changedFile ? "changed the file" : "replied"
+        return message(agent: agent, when: Text(when)) {
+            VStack(alignment: .leading, spacing: 8) {
+                if !reply.body.isBlank {
+                    MarkdownProse(text: reply.body, projectPath: projectPath, textScale: textScale) { segment in
+                        MarkdownCodeBlock(segment: segment).equatable()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !reply.diff.isEmpty { diff(reply.diff) }
+            }
+        }
+    }
+
+    private func diff(_ lines: [ReviewDiffLine]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text((comment.path as NSString).lastPathComponent)
+                Text("+\(lines.count { $0.kind == .addition })").font(.mono(11)).foregroundStyle(Theme.addition)
+                Text("−\(lines.count { $0.kind == .deletion })").font(.mono(11)).foregroundStyle(Theme.deletion)
+            }
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+            .padding(.horizontal, 12).padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .bottom) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                let added = line.kind == .addition
+                codeLine(number: line.number, text: (added ? "+ " : "- ") + line.text,
+                         ink: added ? Theme.addition : Theme.deletion, numberInk: Color.secondary.opacity(0.6),
+                         fill: (added ? Theme.addition : Theme.deletion).opacity(0.08))
+            }
+        }
+        .codeBox()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Changed lines")
+    }
+
+    // One voice in the thread: you, or the agent when one is given.
+    private func message<Content: View>(agent: AgentKind?, when: Text?,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        let isYou = agent == nil
+        return HStack(alignment: .top, spacing: 10) {
+            ReviewAvatar(agent: agent, size: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 7) {
+                    Text(isYou ? "You" : agent?.title ?? "").font(.system(size: 12, weight: .semibold))
+                    if isYou, when == nil {
+                        if comment.kind == .question {
+                            QuestionTag()
+                        } else {
+                            Text("Change")
+                                .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Theme.accent)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Capsule().fill(Theme.accent.opacity(0.09)))
+                                .fixedSize()
+                        }
+                    }
+                    if let when { when.font(.system(size: 11)).foregroundStyle(.tertiary) }
+                }
+                .frame(minHeight: 22)
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var suggestion: String? {
+        guard let last = replies.last, last.author == .agent else { return nil }
+        return last.suggestion
+    }
+
+    private var actions: some View {
+        HStack(spacing: 8) {
+            if let suggestion, !replying {
+                Button { reply(suggestion) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark").font(.system(size: 10, weight: .bold))
+                        Text(suggestion).lineLimit(1)
+                    }
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(Theme.plan)
+                    .padding(.horizontal, 11).frame(height: 26)
+                    .background(Capsule().fill(Theme.card))
+                    .overlay(Capsule().strokeBorder(Theme.plan.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .appTooltip("Send this reply")
+                .accessibilityLabel("Suggested reply: \(suggestion)")
+            }
+            if !replying {
+                ActionButton(title: "Reply", tone: .outlined, height: 26, size: 11.5) {
+                    replying = true
+                    fieldFocused = true
+                }
+            }
+            if let showInDiff {
+                InlineLink(title: "Show in diff", size: 11.5, tint: Color.secondary, action: showInDiff)
+            }
+            Spacer(minLength: 0)
+            InlineLink(title: "Resolve", size: 11.5, tint: Color.secondary, action: resolve)
+        }
+        .padding(.leading, 48).padding(.trailing, 16).padding(.bottom, 14)
+    }
+
+    private var replyBox: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Reply to \(agent.title) about these lines", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .lineLimit(2...8)
+                .focused($fieldFocused)
+                .onSubmit(send)
+                .onExitCommand(perform: cancel)
+                .accessibilityLabel("Reply to \(agent.title)")
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    KeyCap(key: "↩"); Text("send")
+                    KeyCap(key: "esc"); Text("cancel")
+                }
+                .font(.system(size: 11)).foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+                Spacer(minLength: 0)
+                InlineLink(title: "Cancel", size: 11.5, tint: Color.secondary, action: cancel)
+                ActionButton(title: "Send reply", tone: .green, height: 26, size: 11.5, action: send)
+                    .disabled(draft.isBlank)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.accent.opacity(0.5)))
+        .padding(.leading, 48).padding(.trailing, 16).padding(.bottom, 14)
+        .onAppear { fieldFocused = true }
+    }
+
+    private func send() {
+        guard !draft.isBlank else { return }
+        reply(draft.trimmed)
+        draft = ""
+        replying = false
+    }
+
+    private func cancel() {
+        draft = ""
+        replying = false
+    }
+}
+
+private extension View {
+    func codeBox() -> some View {
+        clipShape(RoundedRectangle(cornerRadius: 8))
+            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.sunken))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline))
+    }
+}
+
+// MARK: - In Chat
+
+// A sent review as it sits in the conversation: one card, posted when the review goes
+// and updated in place as the agent works, with each comment as a thread.
+struct ReviewCard: View {
+    let round: ReviewRound
+    let agent: AgentKind
+    // The turn that took the review is still running.
+    let working: Bool
+    let checker: AgentKind?
+    var projectPath = ""
+    var textScale: CGFloat = 1
+    let fileName: (ReviewComment) -> String
+    let openInChanges: () -> Void
+    let reply: (ReviewComment, String) -> Void
+    let resolve: (ReviewComment) -> Void
+    let reopen: (ReviewComment) -> Void
+    let showInDiff: (ReviewComment) -> Void
+    let reviewWhatChanged: () -> Void
+    let checkFixes: () -> Void
+
+    private var settling: Bool { working && !round.isSettled }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            ForEach(round.comments) { comment in
+                ReviewThreadView(round: round, comment: comment, agent: agent, fileName: fileName(comment),
+                                 working: working, projectPath: projectPath, textScale: textScale,
+                                 reply: { reply(comment, $0) },
+                                 resolve: { resolve(comment) },
+                                 reopen: { reopen(comment) },
+                                 showInDiff: round.outcomes?[comment.id] == .changed && !comment.onFile
+                                    ? { showInDiff(comment) } : nil)
+                if comment.id != round.comments.last?.id {
+                    Rectangle().fill(Theme.hairline).frame(height: 1)
                 }
             }
             if !round.note.isBlank {
                 (Text("Also: ").foregroundStyle(.secondary) + Text(round.note))
                     .font(.system(size: 12))
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16).padding(.bottom, 12)
             }
+            footer
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.userMessage))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.userMessageRing))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .cardSurface(cornerRadius: 12)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Your review, \(counted(round.comments.count, "comment"))")
     }
-}
 
-// What came of a sent review, comment by comment, once the turn that took it ends.
-struct ReviewFollowUpCard: View {
-    let round: ReviewRound
-    let agentTitle: String
-    let working: Bool
-    let checker: AgentKind?
-    let fileName: (ReviewComment) -> String
-    let showChange: (ReviewComment) -> Void
-    let readAnswer: () -> Void
-    let commentAgain: (ReviewComment) -> Void
-    let reviewWhatChanged: () -> Void
-    let checkFixes: () -> Void
+    private var header: some View {
+        HStack(spacing: 10) {
+            ReviewAvatar(agent: nil, size: 22)
+            Text("Your review").font(.serif(15, .semibold))
+            subtitle.font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
+            Spacer(minLength: 0)
+            tally
+            InlineLink(title: "Open in Changes", size: 11.5, action: openInChanges)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Theme.userMessage)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.userMessageRing).frame(height: 1) }
+    }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                if round.isSettled {
-                    Image(systemName: "checkmark.seal.fill").font(.system(size: 18)).foregroundStyle(Theme.dotOn)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(round.isSettled ? "\(agentTitle) worked through your review"
-                         : "\(agentTitle) is working through your review")
-                        .font(.serif(14, .semibold))
-                    Text(round.isSettled ? "Each comment checked against the files when the turn ended"
-                         : working ? "Each comment is checked once the turn ends" : "Waiting for the turn to end")
-                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-                tally
+    private var subtitle: Text {
+        let count = counted(round.comments.count, "comment")
+        let resolved = round.comments.count { round.resolved.contains($0.id) }
+        if resolved == round.comments.count { return Text(count + " · all resolved") }
+        if resolved > 0 { return Text(count + " · \(resolved) resolved") }
+        return Text(count + " · sent ") + Text(round.sent, format: .relative(presentation: .named))
+    }
+
+    @ViewBuilder private var tally: some View {
+        if settling {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("\(agent.title) is working through it")
             }
-            VStack(spacing: 0) {
-                ForEach(round.comments) { comment in
-                    row(comment)
-                    if comment.id != round.comments.last?.id {
-                        Rectangle().fill(Theme.hairline).frame(height: 1)
-                    }
+            .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(Theme.field))
+        } else {
+            HStack(spacing: 6) {
+                ForEach([ReviewRound.Status.changed, .answered, .unchanged, .waiting], id: \.label) { status in
+                    let count = round.comments.count { round.status($0.id) == status }
+                    if count > 0 { ReviewStatusChip(status: status, label: "\(count) " + status.label.lowercased()) }
                 }
             }
-            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.field))
-            HStack(spacing: 10) {
-                ActionButton(title: "Review what changed", tone: .green, height: 30, size: 12,
-                             icon: "plusminus", action: reviewWhatChanged)
-                if let checker {
-                    ActionButton(title: "Ask \(checker.title) to check the fixes", tone: .outlined, height: 30,
-                                 size: 12, icon: "person.2", action: checkFixes)
-                        .disabled(round.trees.isEmpty)
-                }
-                Spacer(minLength: 0)
-                Text("The check reads only what changed since you sent the review")
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            ActionButton(title: "Review what changed", tone: .green, height: 30, size: 12,
+                         icon: "plusminus", action: reviewWhatChanged)
+            if let checker {
+                ActionButton(title: "Ask \(checker.title) to check the fixes", tone: .outlined, height: 30,
+                             size: 12, icon: "person.2", action: checkFixes)
+                    .disabled(round.trees.isEmpty)
+            }
+            Spacer(minLength: 0)
+            if let checker {
+                Text("\(checker.title) reads only what changed since you sent the review")
                     .font(.system(size: 11)).foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .disabled(!round.isSettled)
         }
-        .padding(14)
-        .cardSurface(cornerRadius: 12)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(round.isSettled ? "\(agentTitle) worked through your review"
-                            : "\(agentTitle) is working through your review")
-    }
-
-    private var tally: some View {
-        HStack(spacing: 6) {
-            ForEach([ReviewRound.Outcome.changed, .answered, .unchanged], id: \.self) { outcome in
-                let count = round.outcomes?.values.count { $0 == outcome } ?? 0
-                if count > 0 { status(outcome, label: "\(count) " + short(outcome)) }
-            }
-            if !round.isSettled {
-                Text("\(round.comments.count) waiting").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func short(_ outcome: ReviewRound.Outcome) -> String {
-        switch outcome {
-        case .changed: "changed"
-        case .answered: "answered"
-        case .unchanged: "not changed"
-        }
-    }
-
-    private func row(_ comment: ReviewComment) -> some View {
-        let outcome = round.outcomes?[comment.id]
-        return HStack(spacing: 10) {
-            if let outcome {
-                status(outcome, label: outcome.label).frame(width: 118, alignment: .leading)
-            } else {
-                HStack(spacing: 4) {
-                    Image(systemName: "clock").font(.system(size: 9, weight: .semibold))
-                    Text("Waiting")
-                }
-                .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                .frame(width: 118, alignment: .leading)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                ReviewText(text: comment.body, size: 12, lineLimit: 1)
-                Text(Self.place(comment, fileName: fileName)).font(.mono(10.5)).foregroundStyle(.tertiary)
-            }
-            Spacer(minLength: 8)
-            switch outcome {
-            case .changed:
-                InlineLink(title: "Show change", size: 11.5) { showChange(comment) }
-            case .answered:
-                InlineLink(title: "Read answer", size: 11.5, action: readAnswer)
-            case .unchanged:
-                InlineLink(title: "Read why", size: 11.5, tint: Color.secondary, action: readAnswer)
-                if round.returned.contains(comment.id) {
-                    Text("Back in your review").font(.system(size: 11)).foregroundStyle(.tertiary)
-                } else {
-                    ActionButton(title: "Comment again", tone: .outlined, height: 24, size: 11) { commentAgain(comment) }
-                }
-            case nil:
-                EmptyView()
-            }
-        }
-        .padding(.horizontal, 10).padding(.vertical, 8)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel((outcome?.label ?? "Waiting") + ". " + comment.body)
-    }
-
-    private func status(_ outcome: ReviewRound.Outcome, label: String) -> some View {
-        let (icon, ink, fill): (String, Color, Color) = switch outcome {
-        case .changed: ("checkmark", Theme.dotOnText, Theme.dotOn.opacity(0.14))
-        case .answered: ("questionmark.bubble", Theme.plan, Theme.plan.opacity(0.12))
-        case .unchanged: ("text.bubble", Theme.attentionText, Theme.attention.opacity(0.14))
-        }
-        return HStack(spacing: 4) {
-            Image(systemName: icon).font(.system(size: 9, weight: .bold))
-            Text(label).lineLimit(1).fixedSize()
-        }
-        .font(.system(size: 11, weight: .semibold))
-        .foregroundStyle(ink)
-        .padding(.horizontal, 7).padding(.vertical, 3)
-        .background(Capsule().fill(fill))
-    }
-
-    static func place(_ comment: ReviewComment, fileName: (ReviewComment) -> String) -> String {
-        let lines = comment.onFile ? "" : ":" + (comment.lastLine.map { "\(comment.line)–\($0)" } ?? "\(comment.line)")
-        return fileName(comment) + lines
+        .disabled(settling)
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Theme.sunken)
+        .overlay(alignment: .top) { Rectangle().fill(Theme.hairline).frame(height: 1) }
     }
 }

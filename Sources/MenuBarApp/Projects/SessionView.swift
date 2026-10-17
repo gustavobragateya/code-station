@@ -1576,11 +1576,7 @@ struct SessionView: View {
             ScrollView {
                 let visibleMessages = transcriptWindow.visibleMessages(in: session.messages)
                 transcriptContent(session, messages: visibleMessages, state: state,
-                                  projectPath: projectPath,
-                                  reveal: { id in
-                                      transcriptPinnedToBottom = false
-                                      withAnimation(Motion.reveal) { proxy.scrollTo(id, anchor: .top) }
-                                  }) {
+                                  projectPath: projectPath) {
                     transcriptWindow.loadEarlier(totalCount: session.messages.count)
                     // Land on the oldest message the page just added, so the reader
                     // starts at the beginning of what they asked for and reads forward
@@ -1719,7 +1715,6 @@ struct SessionView: View {
     private func transcriptContent(_ session: ChatSession,
                                    messages: ArraySlice<ChatMessage>,
                                    state: SessionState, projectPath: String,
-                                   reveal: @escaping (UUID) -> Void = { _ in },
                                    loadEarlier: @escaping () -> Void) -> some View {
         let bubble = appSettings.userMessageStyle(for: session, in: store)
         let reviewRounds = sentReviews(in: session)
@@ -1757,11 +1752,10 @@ struct SessionView: View {
 
             ForEach(messages) { message in
                 if let round = reviewRounds.cards[message.id] {
-                    ReviewRoundCard(round: round, fileName: { ($0.path as NSString).lastPathComponent },
-                                    openInChanges: openChanges)
+                    reviewCard(round, session: session, working: state.isBusy, projectPath: projectPath)
                         .transition(.fadeIn)
-                } else {
-                MessageView(message: message,
+                } else if !reviewRounds.hidden.contains(message.id) {
+                MessageView(message: reviewRounds.cuts[message.id].map { message.cut(at: $0) } ?? message,
                             projectPath: projectPath,
                             textScale: appSettings.textSize.scale,
                             openChange: { path in
@@ -1783,11 +1777,6 @@ struct SessionView: View {
                     .environment(\.activeTranscriptTools, runner.runningTools(sessionID))
                     .environment(\.agentTranscriptFocus, agentFocus)
                     .transition(.fadeIn)
-                }
-                if let followUp = reviewRounds.followUps[message.id] {
-                    reviewFollowUp(followUp.round, answer: followUp.answer, session: session,
-                                   working: state.isBusy, reveal: reveal)
-                        .transition(.fadeIn)
                 }
             }
 
@@ -1904,53 +1893,99 @@ struct SessionView: View {
         }
     }
 
-    // Reviews sent from Changes, matched to the messages that carried them: each shows as
-    // one card where its prompt would be, and its follow-up closes the turn that took it.
-    private func sentReviews(in session: ChatSession) -> (cards: [UUID: ReviewRound],
-                                                          followUps: [UUID: (round: ReviewRound, answer: UUID?)]) {
-        let rounds = runner.reviews.rounds(sessionID)
-        guard !rounds.isEmpty else { return ([:], [:]) }
+    // Reviews sent from Changes, matched to the messages that carried them. Each shows as
+    // one card where its prompt would be. The answers the agent wrote under each comment's
+    // heading live in the card's threads, so they are cut from the turn's text, and a reply
+    // sent in a thread is left to the thread instead of showing as a message of its own.
+    private func sentReviews(in session: ChatSession) -> (cards: [UUID: ReviewRound], hidden: Set<UUID>,
+                                                          cuts: [UUID: Int]) {
+        let reviews = runner.reviews
+        let rounds = reviews.rounds(sessionID)
+        guard !rounds.isEmpty else { return ([:], [], [:]) }
         var cards: [UUID: ReviewRound] = [:]
-        var followUps: [UUID: (round: ReviewRound, answer: UUID?)] = [:]
+        var hidden: Set<UUID> = []
+        var cuts: [UUID: Int] = [:]
         let messages = session.messages
         for (index, message) in messages.enumerated() where message.role == .user {
-            guard let round = rounds.last(where: { $0.prompt == message.text }) else { continue }
-            cards[message.id] = round
-            var end = index
-            while end + 1 < messages.count, messages[end + 1].role != .user { end += 1 }
-            let answer = messages[(index + 1)...end].last { $0.role == .assistant && !$0.text.isBlank }?.id
-            followUps[messages[end].id] = (round, answer)
+            let prompt = message.text.trimmed
+            let count: Int
+            let settled: Bool
+            if let round = rounds.last(where: { $0.prompt == prompt }) {
+                cards[message.id] = round
+                count = round.comments.count
+                settled = round.isSettled
+            } else if reviews.isThreadReply(prompt: prompt, in: sessionID) {
+                hidden.insert(message.id)
+                count = 1
+                settled = reviews.awaitingReply(prompt: prompt, in: sessionID) == nil
+            } else {
+                continue
+            }
+            guard let reply = messages[(index + 1)...].prefix(while: { $0.role != .user })
+                .last(where: { $0.role == .assistant }) else { continue }
+            // While the turn runs, only text under a heading is known to be an answer.
+            let cut = settled ? ReviewAnswers.read(reply, count: count)?.start : ReviewAnswers.split(reply.text)?.start
+            guard let cut else { continue }
+            if reply.cut(at: cut).isEmpty { hidden.insert(reply.id) } else { cuts[reply.id] = cut }
         }
-        return (cards, followUps)
+        return (cards, hidden, cuts)
     }
 
-    private func reviewFollowUp(_ round: ReviewRound, answer: UUID?, session: ChatSession,
-                                working: Bool, reveal: @escaping (UUID) -> Void) -> some View {
+    private func reviewCard(_ round: ReviewRound, session: ChatSession, working: Bool,
+                            projectPath: String) -> some View {
         let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
         let checker = installed.first { $0 != session.agent } ?? installed.first
-        return ReviewFollowUpCard(
-            round: round, agentTitle: session.agent.title, working: working, checker: checker,
+        let reviews = runner.reviews
+        let directories = store.workingDirectories(for: session)
+        let names = Dictionary(directories.map { ($0, ($0 as NSString).lastPathComponent) },
+                               uniquingKeysWith: { first, _ in first })
+        return ReviewCard(
+            round: round, agent: session.agent, working: working, checker: checker,
+            projectPath: projectPath, textScale: appSettings.textSize.scale,
             fileName: { ($0.path as NSString).lastPathComponent },
-            showChange: { openChange($0.path, root: $0.root) },
-            readAnswer: { if let answer { reveal(answer) } },
-            commentAgain: { runner.reviews.commentAgain($0.id, round: round.id, in: sessionID) },
+            openInChanges: {
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                openChanges()
+            },
+            reply: { comment, text in
+                Task {
+                    guard let prompt = await reviews.reply(text, to: comment.id, round: round.id, in: sessionID,
+                                                           projectNames: names) else { return }
+                    runner.send(prompt, sessionID: sessionID, store: store)
+                }
+            },
+            resolve: { reviews.resolve($0.id, round: round.id, in: sessionID) },
+            reopen: { reviews.reopen($0.id, round: round.id, in: sessionID) },
+            showInDiff: { comment in
+                reviews.markRead(comment.id, in: sessionID)
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                changesNavigation.focusedComment = comment.id
+                openChange(comment.path, root: comment.root)
+            },
             reviewWhatChanged: openChanges,
             checkFixes: {
                 guard let checker, let executable = runner.executable(for: checker) else { return }
-                let repositories = store.workingDirectories(for: session).map {
+                let repositories = directories.map {
                     ReviewRepository(root: $0, name: ($0 as NSString).lastPathComponent)
                 }
-                runner.reviews.startSecondOpinion(sessionID, agent: checker, request: SecondOpinionRequest(
+                reviews.startSecondOpinion(sessionID, agent: checker, request: SecondOpinionRequest(
                     scope: .sinceReview(trees: round.trees), repositories: repositories, executable: executable))
                 changesNavigation.showingHistory = false
                 changesNavigation.showingReview = true
                 openChanges()
             })
+            // Answers read here are read: the thread is open in front of the person.
+            .onChange(of: round.unread, initial: true) { _, unread in
+                for id in unread { reviews.markRead(id, in: sessionID) }
+            }
             // A round whose turn ended while nothing was watching, or before the app was
             // last quit, is settled as soon as it is seen.
             .task(id: "\(round.id)-\(working)") {
                 guard !working, !round.isSettled else { return }
-                await runner.reviews.turnEnded(sessionID, prompt: round.prompt)
+                let reply = store.session(sessionID).flatMap { ReviewAnswers.reply(to: round.prompt, in: $0.messages) }
+                await reviews.turnEnded(sessionID, prompt: round.prompt, reply: reply)
             }
     }
 

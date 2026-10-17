@@ -2659,10 +2659,12 @@ final class SessionRunner {
         records[sessionID]?.startedGroups = carried
         cleanUp(turn)
         restorePreviousConversation(turn, status: status, sessionID: sessionID, store: store)
-        // A review sent to the session is judged against the files as this turn left them.
+        // A review sent to the session is judged against the files as this turn left them,
+        // and what the agent wrote is split into answers to its comments.
         if turn.summary == nil {
             let prompt = turn.prompt
-            Task { await reviews.turnEnded(sessionID, prompt: prompt) }
+            let reply = ReviewAnswers.reply(to: prompt, in: store.session(sessionID)?.messages ?? [])
+            Task { await reviews.turnEnded(sessionID, prompt: prompt, reply: reply) }
         }
 
         // Even a recap must stay stopped after exceeding the limit. Starting queued

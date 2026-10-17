@@ -414,7 +414,7 @@ struct ReviewCommentTests {
         #expect(ReviewRound.outcome(for: removed, fileText: edited, digestAtSend: ReviewRound.digest(file)) == .changed)
     }
 
-    @Test func aSentReviewIsSettledWhenItsTurnEndsAndCanBeCommentedAgain() async throws {
+    @Test func aSentReviewIsSettledWhenItsTurnEndsWithEachAnswerInItsThread() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("review-\(UUID().uuidString).json")
         defer {
             try? FileManager.default.removeItem(at: url)
@@ -434,28 +434,136 @@ struct ReviewCommentTests {
         let round = store.recordRound([untouched, question], prompt: prompt, note: "", roots: [], in: session)
         #expect(store.comments(session).map(\.body) == ["Later"])
         #expect(store.round(prompt: "  " + prompt + "\n", in: session)?.id == round.id)
+        #expect(store.threads(session).map(\.comment.id) == [untouched.id, question.id])
 
         await store.turnEnded(session, prompt: "Something else")
         #expect(store.rounds(session).first?.isSettled == false)
-        await store.turnEnded(session, prompt: prompt)
-        let outcomes = try #require(store.rounds(session).first?.outcomes)
-        #expect(outcomes[untouched.id] == .unchanged)
-        #expect(outcomes[question.id] == .answered)
+        #expect(store.rounds(session).first?.status(untouched.id) == .waiting)
+        let reply = ChatMessage(role: .assistant, text: """
+        I looked at both.
 
-        store.commentAgain(untouched.id, round: round.id, in: session)
-        store.commentAgain(untouched.id, round: round.id, in: session)
-        #expect(store.kept(session).map(\.body) == ["Later", "Guard it"])
+        ### Comment 1
+        It cannot be empty here, so I left it.
+
+        ### Comment 2
+        It returns early so the caller sees the first item.
+        I can add a comment that says so.
+        Suggested reply: "Yes, add it"
+        """)
+        await store.turnEnded(session, prompt: prompt, reply: reply)
+        let settled = try #require(store.rounds(session).first)
+        #expect(settled.status(untouched.id) == .unchanged)
+        #expect(settled.status(question.id) == .answered)
+        #expect(settled.replies(untouched.id).map(\.body) == ["It cannot be empty here, so I left it."])
+        #expect(settled.replies(question.id).first?.suggestion == "Yes, add it")
+        #expect(settled.replies(question.id).first?.body.hasSuffix("I can add a comment that says so.") == true)
+        #expect(store.unreadCount(session) == 2)
+
+        store.markRead(untouched.id, in: session)
+        store.resolve(untouched.id, round: round.id, in: session)
+        #expect(store.unreadCount(session) == 1)
+        #expect(store.rounds(session).first?.status(untouched.id) == .resolved)
+        store.reopen(untouched.id, round: round.id, in: session)
+        #expect(store.rounds(session).first?.status(untouched.id) == .unchanged)
         store.flush()
 
         let reopened = ReviewCommentStore(url: url)
-        #expect(reopened.rounds(session).first?.returned == [untouched.id])
-        #expect(reopened.rounds(session).first?.outcomes?[question.id] == .answered)
+        let saved = try #require(reopened.rounds(session).first)
+        #expect(saved.outcomes?[question.id] == .answered)
+        #expect(saved.replies(question.id).first?.suggestion == "Yes, add it")
+        #expect(saved.unread == [question.id])
+    }
+
+    @Test func aReplyInAThreadGoesAtOnceAndItsAnswerJoinsTheThread() async throws {
+        let store = ReviewCommentStore(url: nil)
+        let files = FileBox(["/repo/App.swift": "let items = load()\nlet first = items.first!\nreturn first"])
+        store.readFile = { files.read($0) }
+        let session = UUID()
+        var question = comment(.new, 2, excerpt: "let first = items.first!", body: "What if it is empty?")
+        question.kind = .question
+        let prompt = ReviewPrompt.feedback([question])
+        let round = store.recordRound([question], prompt: prompt, note: "", roots: [], in: session)
+        await store.turnEnded(session, prompt: prompt,
+                              reply: ChatMessage(role: .assistant, text: "It would crash. I can guard it."))
+        #expect(store.rounds(session).first?.replies(question.id).map(\.body) == ["It would crash. I can guard it."])
+
+        let sent = try #require(await store.reply("Yes, guard it", to: question.id, round: round.id, in: session))
+        #expect(sent.contains("A follow-up on my review comment 1, on App.swift, line 2."))
+        #expect(sent.contains("You answered: It would crash. I can guard it."))
+        #expect(sent.contains("My reply: Yes, guard it"))
+        #expect(sent.contains("### Comment 1"))
+        #expect(store.isThreadReply(prompt: sent, in: session))
+        #expect(store.rounds(session).first?.status(question.id) == .waiting)
+
+        files.files["/repo/App.swift"] = "let items = load()\nguard let first = items.first else { return nil }\nreturn first"
+        await store.turnEnded(session, prompt: sent, reply: ChatMessage(role: .assistant, text: """
+        Let me edit it.
+        ### Comment 1
+        Done, it returns nil when the list is empty.
+        """))
+        let answered = try #require(store.rounds(session).first)
+        #expect(answered.replies(question.id).map(\.author) == [.agent, .you, .agent])
+        #expect(answered.replies(question.id).last?.body == "Done, it returns nil when the list is empty.")
+        #expect(answered.status(question.id) == .changed)
+        #expect(answered.replies(question.id).last?.diff == [
+            ReviewDiffLine(kind: .deletion, number: 2, text: "let first = items.first!"),
+            ReviewDiffLine(kind: .addition, number: 2, text: "guard let first = items.first else { return nil }")
+        ])
+        // The same turn ending twice does not answer twice.
+        await store.turnEnded(session, prompt: sent, reply: nil)
+        #expect(store.rounds(session).first?.replies(question.id).count == 3)
+    }
+
+    @Test func answersAreSplitByTheirHeadingsAndTheRestIsLeftInPlace() throws {
+        let text = "I made the changes.\n\n## Comment 2 - App.swift\nSecond.\n\n**Comment 1**\nFirst.\n- Suggested reply: Move them\n"
+        let found = try #require(ReviewAnswers.split(text))
+        #expect(String(text.prefix(found.start)) == "I made the changes.\n\n")
+        #expect(found.answers[1] == .init(body: "First.", suggestion: "Move them"))
+        #expect(found.answers[2] == .init(body: "Second.", suggestion: nil))
+        #expect(ReviewAnswers.split("Comment 1 is fine as it is.") == nil)
+
+        var turn = ChatMessage(role: .assistant, text: "Reading the file.Done, the name is clearer now.")
+        turn.tools = [ToolUse(id: "1", name: "Edit", input: "{}", textOffset: 17)]
+        let single = try #require(ReviewAnswers.read(turn, count: 1))
+        #expect(single.start == 17)
+        #expect(single.answers[1]?.body == "Done, the name is clearer now.")
+        #expect(ReviewAnswers.read(turn, count: 2) == nil)
+        #expect(turn.cut(at: single.start).text == "Reading the file.")
+        #expect(turn.cut(at: single.start).tools.count == 1)
+    }
+
+    @Test func aThreadShowsOnlyTheChangesNearItsLines() {
+        let before = (1...20).map { "line \($0)" }.joined(separator: "\n")
+        var after = before.components(separatedBy: "\n")
+        after[1] = "changed 2"
+        after[15] = "changed 16"
+        let near = ReviewDiffLine.near(comment(.new, 15, excerpt: "line 15"), before: before,
+                                       after: after.joined(separator: "\n"))
+        #expect(near == [ReviewDiffLine(kind: .deletion, number: 16, text: "line 16"),
+                         ReviewDiffLine(kind: .addition, number: 16, text: "changed 16")])
+        #expect(ReviewDiffLine.near(comment(.new, 15, excerpt: "line 15"), before: before, after: before).isEmpty)
+    }
+
+    @Test func roundsSavedBeforeThreadsStillLoad() throws {
+        let json = """
+        {"id":"\(UUID().uuidString)","sent":0,"prompt":"Fix it","note":"","comments":[],
+         "fileDigests":{},"trees":{},"returned":[]}
+        """
+        let round = try JSONDecoder().decode(ReviewRound.self, from: Data(json.utf8))
+        #expect(round.replies.isEmpty && round.resolved.isEmpty && round.unread.isEmpty)
+        #expect(!round.isSettled)
+    }
+
+    @Test func thePromptAsksForAnAnswerUnderEachComment() {
+        let prompt = ReviewPrompt.feedback([comment(.new, 11, excerpt: "x")])
+        #expect(prompt.contains("`### Comment 1`, `### Comment 2` and so on"))
+        #expect(prompt.contains("Suggested reply:"))
     }
 }
 
 // Hands a test's made-up files to the store in place of the disk.
 private final class FileBox: @unchecked Sendable {
-    let files: [String: String]
+    var files: [String: String]
     init(_ files: [String: String]) { self.files = files }
     func read(_ path: String) -> String? { files[path] }
 }

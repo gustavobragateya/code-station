@@ -290,6 +290,7 @@ enum ReviewPrompt {
         if comments.contains(where: { $0.kind == .question }) {
             text += " A comment marked as a question only needs an answer, not a code change."
         }
+        text += " " + ReviewAnswers.instructions
         for (index, comment) in ordered.enumerated() {
             var file = comment.path
             if spansProjects {
@@ -318,6 +319,160 @@ enum ReviewPrompt {
         }
         if !note.isBlank { text += "\n\nOne more thing: " + note.trimmed }
         return text
+    }
+
+    // A reply in a thread goes at once, as a short turn about those lines alone. It
+    // repeats the comment and the last answer, since the agent may have moved on since.
+    static func reply(_ text: String, to comment: ReviewComment, number: Int, earlier: [ReviewReply],
+                      projectNames: [String: String] = [:]) -> String {
+        var file = comment.path
+        if projectNames.count > 1 {
+            file = (projectNames[comment.root] ?? (comment.root as NSString).lastPathComponent) + "/" + file
+        }
+        let lines = comment.lastLine.map { "lines \(comment.line)–\($0)" } ?? "line \(comment.line)"
+        let place = comment.onFile ? "the whole file"
+            : comment.side == .old ? "removed \(lines) of the previous version" : lines
+        var prompt = "A follow-up on my review comment \(number), on \(file), \(place)."
+        if !comment.excerpt.isBlank { prompt += "\n```\n" + comment.excerpt + "\n```" }
+        prompt += "\nI wrote: " + comment.body.trimmed
+        if let answer = earlier.last(where: { $0.author == .agent }), !answer.body.isBlank {
+            prompt += "\n\nYou answered: " + answer.body.trimmed
+        }
+        prompt += "\n\nMy reply: " + text.trimmed
+        prompt += "\n\nAnswer under a heading line that says `### Comment \(number)`. " + ReviewAnswers.suggestionInstructions
+        return prompt
+    }
+}
+
+// The agent answers each comment under a heading of its own, so the app can hang each
+// answer under the comment it is about instead of leaving it as loose prose.
+enum ReviewAnswers {
+    struct Answer: Equatable, Sendable {
+        var body: String
+        // A short reply the agent offers, for when it proposes to do something more.
+        var suggestion: String?
+    }
+
+    static let suggestionInstructions = "If you offer to do something more, end that answer with a line that starts "
+        + "`Suggested reply:` followed by the few words I could send to say yes."
+
+    static let instructions = "When you are done, answer each comment in a few sentences under a heading line "
+        + "of its own: `### Comment 1`, `### Comment 2` and so on, using the numbers below. "
+        + suggestionInstructions
+
+    // Where the answers start in a turn's text, and each one by the number of its comment.
+    // Nil when the agent wrote no headings at all.
+    static func split(_ text: String) -> (start: Int, answers: [Int: Answer])? {
+        let lines = text.components(separatedBy: "\n")
+        var answers: [Int: Answer] = [:]
+        var start: Int?
+        var offset = 0
+        var current: (number: Int, lines: [String])?
+        func close() {
+            guard let current else { return }
+            let answer = read(current.lines.joined(separator: "\n"))
+            if let existing = answers[current.number] {
+                answers[current.number] = Answer(body: existing.body + "\n\n" + answer.body,
+                                                 suggestion: answer.suggestion ?? existing.suggestion)
+            } else {
+                answers[current.number] = answer
+            }
+        }
+        for line in lines {
+            if let number = heading(line) {
+                close()
+                if start == nil { start = offset }
+                current = (number, [])
+            } else {
+                current?.lines.append(line)
+            }
+            offset += line.count + 1
+        }
+        close()
+        guard let start else { return nil }
+        return (start, answers)
+    }
+
+    // A turn's answers, read from the message it ended with. One comment answered without
+    // a heading is answered by the turn's last words, after its last tool call.
+    static func read(_ message: ChatMessage, count: Int) -> (start: Int, answers: [Int: Answer])? {
+        if let found = split(message.text) { return found }
+        guard count == 1 else { return nil }
+        let start = min(message.tools.compactMap(\.textOffset).max() ?? 0, message.text.count)
+        let tail = String(message.text.dropFirst(start))
+        guard !tail.isBlank else { return nil }
+        return (start, [1: read(tail)])
+    }
+
+    // The message that answered a prompt: the agent's turn right after it.
+    static func reply(to prompt: String, in messages: [ChatMessage]) -> ChatMessage? {
+        let text = prompt.trimmed
+        guard let index = messages.lastIndex(where: { $0.role == .user && $0.text.trimmed == text }) else { return nil }
+        return messages[(index + 1)...].prefix { $0.role != .user }.last { $0.role == .assistant }
+    }
+
+    private static func heading(_ line: String) -> Int? {
+        guard let match = line.firstMatch(of: /^\s{0,3}(?:#{1,6}\s*|\*\*)Comment\s+(\d+)\b.*$/.ignoresCase()) else {
+            return nil
+        }
+        return Int(match.1)
+    }
+
+    private static func read(_ section: String) -> Answer {
+        var lines = section.components(separatedBy: "\n")
+        while lines.last?.isBlank == true { lines.removeLast() }
+        var suggestion: String?
+        if let last = lines.last,
+           let match = last.firstMatch(of: /^\s*(?:[-*]\s*)?\**_?Suggested reply:?\**_?:?\s*(.+)$/.ignoresCase()) {
+            let words = String(match.1).trimmingCharacters(in: CharacterSet(charactersIn: "\"'`*_“”‘’ "))
+            if !words.isEmpty { suggestion = words }
+            lines.removeLast()
+        }
+        return Answer(body: lines.joined(separator: "\n").trimmed, suggestion: suggestion)
+    }
+}
+
+// One line of the small diff shown in a thread: what the agent changed near a comment.
+struct ReviewDiffLine: Codable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable { case addition, deletion }
+    var kind: Kind
+    var number: Int
+    var text: String
+
+    // The lines that changed between two versions of a file, near the lines a comment
+    // was left on. A comment on the whole file, or on removed lines, takes the first
+    // changes in the file.
+    static func near(_ comment: ReviewComment, before: String, after: String, limit: Int = 12) -> [ReviewDiffLine] {
+        guard before != after else { return [] }
+        let old = before.components(separatedBy: "\n")
+        let new = after.components(separatedBy: "\n")
+        var removed = Set<Int>()
+        var inserted = Set<Int>()
+        for change in new.difference(from: old) {
+            switch change {
+            case .remove(let offset, _, _): removed.insert(offset)
+            case .insert(let offset, _, _): inserted.insert(offset)
+            }
+        }
+        // Each changed line with the place in the old file it sits at.
+        var rows: [(line: ReviewDiffLine, at: Int)] = []
+        var i = 0
+        var j = 0
+        while i < old.count || j < new.count {
+            if i < old.count, removed.contains(i) {
+                rows.append((ReviewDiffLine(kind: .deletion, number: i + 1, text: old[i]), i))
+                i += 1
+            } else if j < new.count, inserted.contains(j) {
+                rows.append((ReviewDiffLine(kind: .addition, number: j + 1, text: new[j]), i))
+                j += 1
+            } else {
+                i += 1
+                j += 1
+            }
+        }
+        guard comment.side == .new, !comment.onFile else { return Array(rows.prefix(limit).map(\.line)) }
+        let near = (comment.line - 1 - 3)...((comment.lastLine ?? comment.line) - 1 + 3)
+        return Array(rows.filter { near.contains($0.at) }.prefix(limit).map(\.line))
     }
 }
 
@@ -396,17 +551,44 @@ struct SecondOpinionRun: Equatable, Identifiable {
     var isRunning: Bool { state == .running }
 }
 
-// A sent review, kept so Chat can show it as one card and say afterwards what came of
-// each comment.
+// A message in a sent comment's thread, after the comment itself: the agent's answer,
+// or a reply from you.
+struct ReviewReply: Identifiable, Codable, Equatable, Sendable {
+    enum Author: String, Codable, Sendable {
+        case you, agent
+    }
+
+    var id = UUID()
+    var author: Author
+    var body: String
+    var sent = Date()
+    // Yours: the exact words the agent was given, which is how its turn is recognised.
+    var prompt: String?
+    // The agent's: a reply it offers, sent with one click.
+    var suggestion: String?
+    // The agent's: what it changed near the comment, and whether it touched the file.
+    var diff: [ReviewDiffLine] = []
+    var changedFile = false
+}
+
+// A sent review, kept so Chat and Changes can show each comment as a thread: the
+// comment, what came of it, the agent's answer and any replies after.
 struct ReviewRound: Identifiable, Codable, Equatable, Sendable {
     enum Outcome: String, Codable, Sendable {
         case changed, answered, unchanged
+    }
+
+    // Where a thread stands, always said in a word and not only a colour.
+    enum Status: Equatable, Sendable {
+        case waiting, answered, changed, unchanged, resolved
 
         var label: String {
             switch self {
-            case .changed: "Lines changed"
+            case .waiting: "Waiting"
             case .answered: "Answered"
+            case .changed: "Changed"
             case .unchanged: "Not changed"
+            case .resolved: "Resolved"
             }
         }
     }
@@ -426,10 +608,55 @@ struct ReviewRound: Identifiable, Codable, Equatable, Sendable {
     var trees: [String: String] = [:]
     // Filled in once the turn that took the review ends.
     var outcomes: [UUID: Outcome]?
-    // Comments put back in the review with Comment again.
-    var returned: [UUID] = []
+    // Each comment's thread after the comment, by the comment's id.
+    var replies: [UUID: [ReviewReply]] = [:]
+    var resolved: Set<UUID> = []
+    // Comments with an answer from the agent that has not been opened yet.
+    var unread: Set<UUID> = []
+
+    init(prompt: String, note: String, comments: [ReviewComment]) {
+        self.prompt = prompt
+        self.note = note
+        self.comments = comments
+    }
+
+    // Rounds saved before comments had threads still load, with none.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        sent = try values.decode(Date.self, forKey: .sent)
+        prompt = try values.decode(String.self, forKey: .prompt)
+        note = try values.decode(String.self, forKey: .note)
+        comments = try values.decode([ReviewComment].self, forKey: .comments)
+        fileDigests = try values.decodeIfPresent([String: String].self, forKey: .fileDigests) ?? [:]
+        trees = try values.decodeIfPresent([String: String].self, forKey: .trees) ?? [:]
+        outcomes = try values.decodeIfPresent([UUID: Outcome].self, forKey: .outcomes)
+        replies = try values.decodeIfPresent([UUID: [ReviewReply]].self, forKey: .replies) ?? [:]
+        resolved = try values.decodeIfPresent(Set<UUID>.self, forKey: .resolved) ?? []
+        unread = try values.decodeIfPresent(Set<UUID>.self, forKey: .unread) ?? []
+    }
 
     var isSettled: Bool { outcomes != nil }
+
+    func replies(_ commentID: UUID) -> [ReviewReply] { replies[commentID] ?? [] }
+
+    // A reply of yours the agent has not answered yet.
+    func isAwaitingReply(_ commentID: UUID) -> Bool { replies(commentID).last?.author == .you }
+
+    func status(_ commentID: UUID) -> Status {
+        if resolved.contains(commentID) { return .resolved }
+        guard let outcome = outcomes?[commentID], !isAwaitingReply(commentID) else { return .waiting }
+        switch outcome {
+        case .changed: return .changed
+        case .answered: return .answered
+        case .unchanged: return .unchanged
+        }
+    }
+
+    // The comment's place in the round, counted from 1, as the prompt numbers it.
+    func number(_ commentID: UUID) -> Int? {
+        comments.firstIndex { $0.id == commentID }.map { $0 + 1 }
+    }
 
     // What came of one comment, judged from the file as it is now. A question was asked
     // to be answered, so it was. Otherwise the comment's code still on its own lines means
@@ -464,6 +691,9 @@ final class ReviewCommentStore {
     // closed and reopened while one runs.
     private(set) var runs: [UUID: [SecondOpinionRun]] = [:]
     private var rounds: [UUID: [ReviewRound]] = [:]
+    // What each file held when a review or a reply went, by round or reply id, so the
+    // answer can show what the agent changed. Kept only while the app runs.
+    @ObservationIgnored private var sentTexts: [UUID: [String: String]] = [:]
 
     @ObservationIgnored private var tasks: [UUID: [AgentKind: Task<Void, Never>]] = [:]
     @ObservationIgnored private let url: URL?
@@ -750,6 +980,39 @@ final class ReviewCommentStore {
         return rounds(sessionID).last { $0.prompt == text }
     }
 
+    // The thread a reply of yours belongs to, while the agent has yet to answer it.
+    func awaitingReply(prompt: String, in sessionID: UUID) -> (round: ReviewRound, commentID: UUID)? {
+        let text = prompt.trimmed
+        for round in rounds(sessionID).reversed() {
+            for (commentID, replies) in round.replies where replies.last?.author == .you && replies.last?.prompt == text {
+                return (round, commentID)
+            }
+        }
+        return nil
+    }
+
+    // Whether a prompt was a reply in a thread, answered or not, so Chat can leave it to
+    // the thread instead of showing it as a message of its own.
+    func isThreadReply(prompt: String, in sessionID: UUID) -> Bool {
+        let text = prompt.trimmed
+        return rounds(sessionID).contains { round in
+            round.replies.values.contains { $0.contains { $0.author == .you && $0.prompt == text } }
+        }
+    }
+
+    // Every sent comment on one file, with the round it went in, oldest first.
+    func threads(_ sessionID: UUID, root: String, path: String) -> [(round: ReviewRound, comment: ReviewComment)] {
+        threads(sessionID).filter { $0.comment.root == root && $0.comment.path == path }
+    }
+
+    func threads(_ sessionID: UUID) -> [(round: ReviewRound, comment: ReviewComment)] {
+        rounds(sessionID).flatMap { round in round.comments.map { (round, $0) } }
+    }
+
+    func unreadCount(_ sessionID: UUID) -> Int {
+        rounds(sessionID).reduce(0) { $0 + $1.unread.count }
+    }
+
     // The trees the latest round recorded, for a reviewer asked to read only what
     // changed after it. Nil until a review has gone and its trees are in.
     func latestTrees(_ sessionID: UUID) -> [String: String]? {
@@ -766,62 +1029,141 @@ final class ReviewCommentStore {
         rounds[sessionID, default: []].append(round)
         remove(Set(sent.map(\.id)), from: sessionID)
         saver?.schedule()
-        let read = readFile
         let files = Set(sent.map { ReviewRound.fileKey(root: $0.root, path: $0.path) })
         Task { [weak self] in
-            let digests = await Task.detached(priority: .utility) {
-                var digests: [String: String] = [:]
-                for file in files { digests[file] = read(file).map(ReviewRound.digest) }
-                return digests
-            }.value
+            guard let texts = await self?.readFiles(files) else { return }
             var trees: [String: String] = [:]
             for root in roots {
                 if let tree = await TreeSnapshots.shared.record(at: root) { trees[root] = tree }
             }
-            self?.fillRound(round.id, digests: digests, trees: trees, in: sessionID)
+            self?.fillRound(round.id, texts: texts, trees: trees, in: sessionID)
         }
         return round
     }
 
-    private func fillRound(_ id: UUID, digests: [String: String], trees: [String: String], in sessionID: UUID) {
+    private func readFiles(_ files: Set<String>) async -> [String: String] {
+        let read = readFile
+        return await Task.detached(priority: .utility) {
+            var texts: [String: String] = [:]
+            for file in files { texts[file] = read(file) }
+            return texts
+        }.value
+    }
+
+    private func fillRound(_ id: UUID, texts: [String: String], trees: [String: String], in sessionID: UUID) {
+        sentTexts[id] = texts
         guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == id }) else { return }
-        rounds[sessionID]?[index].fileDigests.merge(digests) { old, _ in old }
+        rounds[sessionID]?[index].fileDigests.merge(texts.mapValues(ReviewRound.digest)) { old, _ in old }
         rounds[sessionID]?[index].trees.merge(trees) { old, _ in old }
         saver?.schedule()
     }
 
-    // The turn that took a review has ended: each of its comments is checked against the
-    // files as they are now. A turn that ran something else first leaves it waiting.
-    func turnEnded(_ sessionID: UUID, prompt: String) async {
-        guard let round = round(prompt: prompt, in: sessionID), !round.isSettled else { return }
+    // A turn has ended. If it took a review, each comment is checked against the files
+    // as they are now and gets its answer from what the agent wrote. If it took a reply in
+    // a thread, the agent's answer joins that thread. Any other turn changes nothing.
+    func turnEnded(_ sessionID: UUID, prompt: String, reply: ChatMessage? = nil) async {
+        if let round = round(prompt: prompt, in: sessionID), !round.isSettled {
+            await settle(round, reply: reply, in: sessionID)
+        } else if let waiting = awaitingReply(prompt: prompt, in: sessionID) {
+            await answer(waiting.commentID, round: waiting.round, prompt: prompt.trimmed, reply: reply, in: sessionID)
+        }
+    }
+
+    private func settle(_ round: ReviewRound, reply: ChatMessage?, in sessionID: UUID) async {
         let read = readFile
         let comments = round.comments
         let digests = round.fileDigests
-        let outcomes = await Task.detached(priority: .utility) {
+        let before = sentTexts[round.id] ?? [:]
+        let checked = await Task.detached(priority: .utility) {
             var outcomes: [UUID: ReviewRound.Outcome] = [:]
+            var diffs: [UUID: [ReviewDiffLine]] = [:]
             for comment in comments {
                 let key = ReviewRound.fileKey(root: comment.root, path: comment.path)
-                outcomes[comment.id] = ReviewRound.outcome(for: comment, fileText: read(key),
-                                                           digestAtSend: digests[key])
+                let now = read(key)
+                outcomes[comment.id] = ReviewRound.outcome(for: comment, fileText: now, digestAtSend: digests[key])
+                if let old = before[key], let now {
+                    diffs[comment.id] = ReviewDiffLine.near(comment, before: old, after: now)
+                }
             }
-            return outcomes
+            return (outcomes, diffs)
         }.value
-        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == round.id }) else { return }
-        rounds[sessionID]?[index].outcomes = outcomes
+        let answers = reply.flatMap { ReviewAnswers.read($0, count: comments.count) }?.answers ?? [:]
+        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == round.id }),
+              rounds[sessionID]?[index].isSettled == false else { return }
+        rounds[sessionID]?[index].outcomes = checked.0
+        for (offset, comment) in comments.enumerated() {
+            let answer = answers[offset + 1]
+            let diff = checked.1[comment.id] ?? []
+            guard answer != nil || !diff.isEmpty else { continue }
+            rounds[sessionID]?[index].replies[comment.id, default: []].append(ReviewReply(
+                author: .agent, body: answer?.body ?? "", suggestion: answer?.suggestion,
+                diff: diff, changedFile: checked.0[comment.id] == .changed))
+            rounds[sessionID]?[index].unread.insert(comment.id)
+        }
+        sentTexts[round.id] = nil
         saver?.schedule()
     }
 
-    // Comment again: the comment goes back in the review, kept, to be sent next round.
-    func commentAgain(_ commentID: UUID, round roundID: UUID, in sessionID: UUID) {
-        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == roundID }),
-              let sent = rounds[sessionID]?[index].comments.first(where: { $0.id == commentID }),
-              rounds[sessionID]?[index].returned.contains(commentID) == false else { return }
-        var again = sent
-        again.id = UUID()
-        again.status = .kept
-        again.created = Date()
-        add(again, to: sessionID)
-        rounds[sessionID]?[index].returned.append(commentID)
+    private func answer(_ commentID: UUID, round: ReviewRound, prompt: String, reply: ChatMessage?,
+                        in sessionID: UUID) async {
+        guard let comment = round.comments.first(where: { $0.id == commentID }),
+              let mine = round.replies(commentID).last else { return }
+        let key = ReviewRound.fileKey(root: comment.root, path: comment.path)
+        let read = readFile
+        let now = await Task.detached(priority: .utility) { read(key) }.value
+        let before = sentTexts[mine.id]?[key]
+        let changed = before != nil && now != nil && before != now
+        let diff = changed ? ReviewDiffLine.near(comment, before: before!, after: now!) : []
+        let number = round.number(commentID) ?? 1
+        let answers = reply.flatMap { ReviewAnswers.read($0, count: 1) }?.answers ?? [:]
+        let answer = answers[number] ?? (answers.count == 1 ? answers.values.first : nil)
+        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == round.id }),
+              rounds[sessionID]?[index].replies(commentID).last?.prompt == prompt else { return }
+        rounds[sessionID]?[index].replies[commentID, default: []].append(ReviewReply(
+            author: .agent, body: answer?.body ?? "", suggestion: answer?.suggestion,
+            diff: diff, changedFile: changed))
+        if changed { rounds[sessionID]?[index].outcomes?[commentID] = .changed }
+        rounds[sessionID]?[index].unread.insert(commentID)
+        sentTexts[mine.id] = nil
+        saver?.schedule()
+    }
+
+    // A reply in a thread goes to the agent at once. Hands back the prompt to send, once
+    // what the file holds now has been read, so the answer can show what the agent changed.
+    func reply(_ text: String, to commentID: UUID, round roundID: UUID, in sessionID: UUID,
+               projectNames: [String: String] = [:]) async -> String? {
+        guard !text.isBlank,
+              let index = rounds[sessionID]?.firstIndex(where: { $0.id == roundID }),
+              let round = rounds[sessionID]?[index],
+              let comment = round.comments.first(where: { $0.id == commentID }),
+              let number = round.number(commentID) else { return nil }
+        let prompt = ReviewPrompt.reply(text, to: comment, number: number, earlier: round.replies(commentID),
+                                        projectNames: projectNames).trimmed
+        let mine = ReviewReply(author: .you, body: text.trimmed, prompt: prompt)
+        rounds[sessionID]?[index].replies[commentID, default: []].append(mine)
+        rounds[sessionID]?[index].resolved.remove(commentID)
+        rounds[sessionID]?[index].unread.remove(commentID)
+        saver?.schedule()
+        sentTexts[mine.id] = await readFiles([ReviewRound.fileKey(root: comment.root, path: comment.path)])
+        return prompt
+    }
+
+    func resolve(_ commentID: UUID, round roundID: UUID, in sessionID: UUID) {
+        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == roundID }) else { return }
+        rounds[sessionID]?[index].resolved.insert(commentID)
+        rounds[sessionID]?[index].unread.remove(commentID)
+        saver?.schedule()
+    }
+
+    func reopen(_ commentID: UUID, round roundID: UUID, in sessionID: UUID) {
+        guard let index = rounds[sessionID]?.firstIndex(where: { $0.id == roundID }) else { return }
+        rounds[sessionID]?[index].resolved.remove(commentID)
+        saver?.schedule()
+    }
+
+    func markRead(_ commentID: UUID, in sessionID: UUID) {
+        guard let index = rounds[sessionID]?.firstIndex(where: { $0.unread.contains(commentID) }) else { return }
+        rounds[sessionID]?[index].unread.remove(commentID)
         saver?.schedule()
     }
 
