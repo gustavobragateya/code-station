@@ -1,8 +1,8 @@
 import Foundation
 import Observation
 
-// Which version of a file a review comment points into. Added and unchanged lines are
-// numbered in the new file; a removed line only exists in the old one.
+// Which version of a file a review comment points into. Added lines use the new file,
+// removed lines use the old one, and unchanged lines can belong to a range in either.
 enum ReviewSide: String, Codable, Sendable, Hashable {
     case new, old
 }
@@ -51,18 +51,22 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
     var line: Int
     var lastLine: Int?
     var excerpt: String
+    // A collapsed gap leaves holes in the quote. Offsets keep each quoted line at its
+    // position in the range. Without offsets, the quoted lines are consecutive.
+    var excerptOffsets: [Int]?
     var body: String
     var author: Author = .you
     var created = Date()
 
     init(root: String, path: String, anchor: DiffAnchor, excerpt: String, body: String,
-         author: Author = .you) {
+         author: Author = .you, excerptOffsets: [Int]? = nil) {
         self.root = root
         self.path = path
         side = anchor.side
         line = anchor.line
         lastLine = anchor.lastLine
         self.excerpt = excerpt
+        self.excerptOffsets = excerptOffsets
         self.body = body
         self.author = author
     }
@@ -91,6 +95,9 @@ struct NumberedDiffLine: Equatable {
         var numbered: [NumberedDiffLine] = []
         for row in DiffComparisonRow.align(lines) {
             if let left = row.left, left == row.right {
+                if left.kind == .context, let number = row.oldNumber {
+                    numbered.append(.init(id: left.id, side: .old, number: number, code: code(left)))
+                }
                 if left.kind == .context, let number = row.newNumber {
                     numbered.append(.init(id: left.id, side: .new, number: number, code: code(left)))
                 }
@@ -104,6 +111,12 @@ struct NumberedDiffLine: Equatable {
             }
         }
         return numbered
+    }
+
+    static func excerpt(_ anchor: DiffAnchor, in diff: [DiffLine]) -> (text: String, offsets: [Int]) {
+        let range = anchor.line...(anchor.lastLine ?? anchor.line)
+        let selected = lines(diff).filter { $0.side == anchor.side && range.contains($0.number) }
+        return (selected.map(\.code).joined(separator: "\n"), selected.map { $0.number - anchor.line })
     }
 
     private static func code(_ line: DiffLine) -> String { String(line.text.dropFirst()) }
@@ -125,7 +138,8 @@ struct ReviewPlacement: Equatable {
         let numbered = NumberedDiffLine.lines(lines)
         var placement = ReviewPlacement()
         for comment in comments.sorted(by: { $0.created < $1.created }) {
-            if let found = locate(comment.anchor, excerpt: comment.excerpt, in: numbered) {
+            if let found = locate(comment.anchor, excerpt: comment.excerpt,
+                                  excerptOffsets: comment.excerptOffsets, in: numbered) {
                 placement.below[found.lastID, default: []].append(comment)
             } else {
                 placement.unplaced.append(comment)
@@ -140,6 +154,7 @@ struct ReviewPlacement: Equatable {
     // places, so if it has moved and could be any of several, it is nowhere rather than
     // somewhere wrong. A comment that quotes nothing can only stay on its own number.
     static func locate(_ anchor: DiffAnchor, excerpt: String,
+                       excerptOffsets: [Int]? = nil,
                        in numbered: [NumberedDiffLine]) -> (anchor: DiffAnchor, lastID: Int)? {
         var lines: [Int: NumberedDiffLine] = [:]
         for line in numbered where line.side == anchor.side { lines[line.number] = line }
@@ -151,8 +166,10 @@ struct ReviewPlacement: Equatable {
             return lines[anchor.line + span].map { (anchor, $0.id) }
         }
         let expected = excerpt.components(separatedBy: "\n").map(\.trimmed)
+        let offsets = excerptOffsets ?? Array(expected.indices)
+        guard offsets.count == expected.count else { return nil }
         func holds(_ start: Int) -> Bool {
-            expected.enumerated().allSatisfy { offset, code in lines[start + offset]?.code.trimmed == code }
+            zip(offsets, expected).allSatisfy { offset, code in lines[start + offset]?.code.trimmed == code }
         }
         if holds(anchor.line), let end = last(from: anchor.line, count: expected.count) {
             return (anchor, end.id)
@@ -304,7 +321,7 @@ final class ReviewCommentStore {
 
     func startSecondOpinion(_ sessionID: UUID, agent: AgentKind, executable: String,
                             repositories: [(root: String, name: String)]) {
-        guard runs[sessionID] == nil, let lead = repositories.first?.root else { return }
+        guard runs[sessionID] == nil, !repositories.isEmpty else { return }
         runs[sessionID] = SecondOpinionRun(agent: agent, started: Date())
         notes[sessionID] = nil
         let searchPath = ProcessManager.searchPath
@@ -315,7 +332,7 @@ final class ReviewCommentStore {
                 outcome = .failure(.init(message: "There are no changes to review."))
             } else {
                 outcome = await SecondOpinion.review(patches, agent: agent, executable: executable,
-                                                     searchPath: searchPath, directory: lead)
+                                                     searchPath: searchPath, repositories: repositories)
             }
             guard !Task.isCancelled, let self else { return }
             self.finishSecondOpinion(sessionID, agent: agent, outcome: outcome)

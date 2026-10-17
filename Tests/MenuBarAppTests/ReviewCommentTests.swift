@@ -26,9 +26,9 @@ struct ReviewCommentTests {
 
     @Test func linesAreNumberedInTheVersionTheyBelongTo() {
         let numbered = NumberedDiffLine.lines(lines)
-        #expect(numbered.map(\.side) == [.new, .old, .new, .new, .new])
-        #expect(numbered.map(\.number) == [10, 11, 11, 12, 13])
-        #expect(numbered[1].code == "let first = items[0]")
+        #expect(numbered.map(\.side) == [.old, .new, .old, .new, .new, .old, .new])
+        #expect(numbered.map(\.number) == [10, 10, 11, 11, 12, 12, 13])
+        #expect(numbered[2].code == "let first = items[0]")
     }
 
     @Test func aCommentSitsUnderTheLineItWasLeftOn() {
@@ -58,6 +58,73 @@ struct ReviewCommentTests {
         let range = comment(.new, 11, excerpt: "let first = items.first!\nprint(first)", lastLine: 12)
         let placement = ReviewPlacement.place([range], in: lines)
         #expect(placement.below[4]?.count == 1)
+    }
+
+    @Test func aRangeAcrossHiddenContextKeepsItsLineOffsets() throws {
+        let lines = separatedChanges()
+        let anchor = DiffAnchor(side: .new, line: 10, lastLine: 20)
+        let quote = NumberedDiffLine.excerpt(anchor, in: lines)
+        #expect(quote.text == "newFirst()\nnewLast()")
+        #expect(quote.offsets == [0, 10])
+        let note = ReviewComment(root: "/repo", path: "App.swift", anchor: anchor,
+                                 excerpt: quote.text, body: "Keep these calls together.",
+                                 excerptOffsets: quote.offsets)
+        let reopened = try JSONDecoder().decode(ReviewComment.self, from: JSONEncoder().encode(note))
+        let placement = ReviewPlacement.place([reopened], in: lines)
+        #expect(placement.unplaced.isEmpty)
+        #expect(placement.below[6]?.map(\.id) == [note.id])
+
+        let moved = ReviewPlacement.locate(anchor, excerpt: quote.text, excerptOffsets: quote.offsets,
+                                           in: NumberedDiffLine.lines(separatedChanges(start: 30)))
+        #expect(moved?.anchor == DiffAnchor(side: .new, line: 30, lastLine: 40))
+
+        var expanded = lines
+        expanded.replaceSubrange(3...3, with: (11...19).map {
+            DiffLine(id: 100 + $0, kind: .context, text: " context\($0)")
+        })
+        #expect(ReviewPlacement.place([note], in: expanded).below[6]?.count == 1)
+
+        var changed = lines
+        changed[6].text = "+differentLast()"
+        #expect(ReviewPlacement.place([note], in: changed).unplaced.map(\.id) == [note.id])
+    }
+
+    @Test func aRemovedRangeIncludesUnchangedLinesBetweenTheDeletions() {
+        let lines = [
+            DiffLine(id: 0, kind: .hunk, text: "@@ -10,3 +10,3 @@"),
+            DiffLine(id: 1, kind: .deletion, text: "-oldFirst()"),
+            DiffLine(id: 2, kind: .addition, text: "+newFirst()"),
+            DiffLine(id: 3, kind: .context, text: " unchanged()"),
+            DiffLine(id: 4, kind: .deletion, text: "-oldLast()"),
+            DiffLine(id: 5, kind: .addition, text: "+newLast()")
+        ]
+        let anchor = DiffAnchor(side: .old, line: 10, lastLine: 12)
+        let quote = NumberedDiffLine.excerpt(anchor, in: lines)
+        #expect(quote.text == "oldFirst()\nunchanged()\noldLast()")
+        #expect(quote.offsets == [0, 1, 2])
+        let note = ReviewComment(root: "/repo", path: "App.swift", anchor: anchor,
+                                 excerpt: quote.text, body: "Keep these calls.", excerptOffsets: quote.offsets)
+        #expect(ReviewPlacement.place([note], in: lines).below[4]?.count == 1)
+    }
+
+    @Test func commentsSavedWithoutOffsetsStillLoadAndFollowTheirCode() throws {
+        let note = comment(.new, 9, excerpt: "let first = items.first!\nprint(first)", lastLine: 10)
+        let data = try JSONEncoder().encode(note)
+        #expect(!String(decoding: data, as: UTF8.self).contains("excerptOffsets"))
+        let reopened = try JSONDecoder().decode(ReviewComment.self, from: data)
+        #expect(reopened.excerptOffsets == nil)
+        #expect(ReviewPlacement.place([reopened], in: lines).below[4]?.count == 1)
+    }
+
+    private func separatedChanges(start: Int = 10) -> [DiffLine] {
+        [DiffLine(id: 0, kind: .hunk, text: "@@ -\(start),1 +\(start),1 @@"),
+         DiffLine(id: 1, kind: .deletion, text: "-oldFirst()"),
+         DiffLine(id: 2, kind: .addition, text: "+newFirst()"),
+         DiffLine(id: 3, kind: .gap, text: "", gap: DiffGap(
+            revision: .workingTree, path: "App.swift", id: 0, start: start + 1, count: 9)),
+         DiffLine(id: 4, kind: .hunk, text: "@@ -\(start + 10),1 +\(start + 10),1 @@"),
+         DiffLine(id: 5, kind: .deletion, text: "-oldLast()"),
+         DiffLine(id: 6, kind: .addition, text: "+newLast()")]
     }
 
     @Test func shiftClickStretchesARunEitherWay() {
@@ -275,7 +342,7 @@ struct SecondOpinionTests {
 
     @Test func thePromptIncludesEveryPatchThatFits() {
         let prompt = SecondOpinion.prompt(for: [patch])
-        #expect(prompt.contains("File: Sources/App.swift\ndiff --git"))
+        #expect(prompt.contains("File: Sources/App.swift\nPath: /repo/Sources/App.swift\ndiff --git"))
         #expect(prompt.contains("Reply with only a JSON array"))
     }
 
@@ -288,8 +355,11 @@ struct SecondOpinionTests {
     }
 
     @Test func noReviewerGetsThePersonsMCPServersOrWriteAccess() throws {
-        let codex = SecondOpinion.arguments(for: .codex, prompt: "p")
-        #expect(codex.contains("mcp_servers={}"))
+        let codex = SecondOpinion.arguments(for: .codex, prompt: "p", codexServers: [
+            DisabledMCPServer(name: "files", transport: .stdio),
+            DisabledMCPServer(name: "remote", transport: .streamableHTTP)
+        ])
+        #expect(codex.contains(#"mcp_servers={"files"={enabled=false,command="/usr/bin/false"},"remote"={enabled=false,url="https://disabled.invalid"}}"#))
         let copilot = SecondOpinion.arguments(for: .copilot, prompt: "p", copilotServers: ["files"])
         #expect(copilot.contains("--deny-tool=shell"))
         #expect(copilot.contains("--deny-tool=write"))
@@ -309,5 +379,40 @@ struct SecondOpinionTests {
     @Test func claudesAnswerIsItsResultField() {
         let output = #"{"type":"result","subtype":"success","result":"[]","is_error":false}"#
         #expect(SecondOpinion.answer(from: output, agent: .claudeCode) == "[]")
+    }
+
+    @Test func workspaceRootsAndOmittedFilesHaveTheirActualPaths() {
+        var attached = patch
+        attached.root = "/worktrees/api-123"
+        attached.label = "API/Sources/App.swift"
+        attached.text = String(repeating: "x", count: SecondOpinion.patchBudget + 1)
+        let prompt = SecondOpinion.prompt(for: [patch, attached], repositories: [
+            (root: "/repo", name: "App"),
+            (root: "/worktrees/api-123", name: "API"),
+            (root: "/elsewhere/shared-456", name: "Shared")
+        ])
+        #expect(prompt.contains("- API: /worktrees/api-123"))
+        #expect(prompt.contains("- Shared: /elsewhere/shared-456"))
+        #expect(prompt.contains("File: API/Sources/App.swift\nPath: /worktrees/api-123/Sources/App.swift"))
+        #expect(!prompt.contains(attached.text))
+    }
+
+    @Test(arguments: [AgentKind.claudeCode, .copilot, .codex])
+    func attachedProjectsCanBeReadWithoutEnablingWrites(_ agent: AgentKind) {
+        let roots = ["/worktrees/attached project", "/elsewhere/shared"]
+        let arguments = SecondOpinion.arguments(for: agent, prompt: "p", addDirectories: roots)
+        if agent == .codex {
+            #expect(arguments.contains("read-only"))
+            #expect(!arguments.contains("--add-dir"))
+        } else if agent == .claudeCode {
+            let start = arguments.firstIndex(of: "--add-dir")
+            #expect(start != nil)
+            #expect(start.map { Array(arguments.dropFirst($0 + 1)) } == roots)
+            #expect(arguments.contains("--disallowedTools"))
+        } else {
+            let granted = arguments.indices.filter { arguments[$0] == "--add-dir" }.map { arguments[$0 + 1] }
+            #expect(granted == roots)
+            #expect(arguments.contains("--deny-tool=write"))
+        }
     }
 }

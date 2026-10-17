@@ -146,7 +146,7 @@ struct AgentLaunchConfiguration: Sendable {
     // config.toml. Supplying only `enabled=false` creates a transport-less table that
     // Codex rejects before startup. One inline table preserves every disabled entry and
     // gives it an inert transport, which also prevents a plugin from adding it back.
-    private static func disabledMCPServersOverride(
+    static func disabledMCPServersOverride(
         _ servers: [DisabledMCPServer]
     ) -> String? {
         let entries = servers

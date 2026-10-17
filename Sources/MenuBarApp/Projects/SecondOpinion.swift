@@ -53,16 +53,17 @@ enum SecondOpinion {
 
     // MARK: - Asking
 
-    static func prompt(for patches: [Patch]) -> String {
+    static func prompt(for patches: [Patch], repositories: [(root: String, name: String)] = []) -> String {
         var budget = patchBudget
         var shown: [String] = []
         var left: [String] = []
         for patch in patches {
+            let file = "File: \(patch.label)\nPath: \((patch.root as NSString).appendingPathComponent(patch.path))"
             if patch.text.utf8.count <= budget {
                 budget -= patch.text.utf8.count
-                shown.append("File: \(patch.label)\n\(patch.text)")
+                shown.append(file + "\n" + patch.text)
             } else {
-                left.append(patch.label)
+                left.append(file)
             }
         }
         var text = """
@@ -73,13 +74,17 @@ enum SecondOpinion {
         Reply with only a JSON array and no other text. Each item is:
         {"file": "<the path after File: below>", "line": <line number in the new version of the file>, "comment": "<one or two sentences addressed to the author>"}
         For a problem on a removed line, use the nearest line in the new version.
-
-        The changes:
         """
+        if !repositories.isEmpty {
+            text += "\n\nProject roots (the first is the working directory):\n"
+                + repositories.map { "- \($0.name): \($0.root)" }.joined(separator: "\n")
+            text += "\nRead the AGENTS.md or CLAUDE.md instructions in each project you review."
+        }
+        text += "\n\nThe changes:"
         text += "\n\n" + shown.joined(separator: "\n\n")
         if !left.isEmpty {
-            text += "\n\nThese files also changed but are too large to include. Read them if you need to: "
-                + left.joined(separator: ", ")
+            text += "\n\nThese files also changed but are too large to include. Read them if you need to:\n"
+                + left.joined(separator: "\n\n")
         }
         return text
     }
@@ -89,27 +94,35 @@ enum SecondOpinion {
     // the person has set up either: any one of those can write, and none is needed to read
     // a diff.
     static func arguments(for agent: AgentKind, prompt: String,
+                          addDirectories: [String] = [],
+                          codexServers: [DisabledMCPServer] = [],
                           copilotServers: [String] = []) -> [String] {
         switch agent {
         case .claudeCode:
-            ["-p", prompt, "--output-format", "json",
+            return ["-p", prompt, "--output-format", "json",
              "--permission-mode", "default",
              "--allowedTools", "Read,Grep,Glob",
              "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash",
              "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#]
+                + (addDirectories.isEmpty ? [] : ["--add-dir"] + addDirectories)
         case .codex:
-            ["exec", "--json", "--skip-git-repo-check",
-             "--sandbox", "read-only",
-             "-c", #"approval_policy="never""#,
-             "-c", "mcp_servers={}",
-             prompt]
+            var arguments = ["exec", "--json", "--skip-git-repo-check",
+                             "--sandbox", "read-only",
+                             "-c", #"approval_policy="never""#]
+            if let override = AgentLaunchConfiguration.disabledMCPServersOverride(codexServers) {
+                arguments += ["-c", override]
+            }
+            // Read-only already permits reads outside the working directory. --add-dir
+            // configures writable roots, which a review does not need.
+            return arguments + [prompt]
         case .copilot:
             // Copilot remembers what was allowed in a folder from one run to the next, and
             // a denial outranks every allowance, so writes and the shell are denied outright.
-            ["-p", prompt, "--output-format", "json",
+            return ["-p", prompt, "--output-format", "json",
              "--no-ask-user", "--disable-builtin-mcps", "--log-level", "none",
              "--deny-tool=shell", "--deny-tool=write"]
                 + copilotServers.flatMap { ["--disable-mcp-server", $0, "--deny-tool=\($0)"] }
+                + addDirectories.flatMap { ["--add-dir", $0] }
         }
     }
 
@@ -124,14 +137,37 @@ enum SecondOpinion {
     }
 
     static func review(_ patches: [Patch], agent: AgentKind, executable: String,
-                       searchPath: String, directory: String) async -> Result<[ReviewComment], Failure> {
+                       searchPath: String, repositories: [(root: String, name: String)]) async -> Result<[ReviewComment], Failure> {
+        guard let directory = repositories.first?.root else {
+            return .failure(Failure(message: "There is no project to review."))
+        }
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = searchPath
         let output: CommandRunner.Output
         do {
+            var codexServers: [DisabledMCPServer] = []
+            if agent == .codex {
+                let listed: CommandRunner.Output
+                do {
+                    listed = try await CommandRunner.run(
+                        executable: executable, arguments: ["mcp", "list", "--json"],
+                        currentDirectory: URL(fileURLWithPath: directory), environment: environment,
+                        timeout: .seconds(30))
+                } catch {
+                    return .failure(Failure(message: "Could not list Codex's MCP servers. " + error.localizedDescription))
+                }
+                guard listed.succeeded, !listed.outputTruncated,
+                      let servers = CodexCodeManager.enabledServers(in: Data(listed.output.utf8)),
+                      servers.allSatisfy({ !$0.name.isEmpty }) else {
+                    return .failure(Failure(message: "Could not list Codex's MCP servers to disable them."))
+                }
+                codexServers = servers
+            }
             output = try await CommandRunner.run(
                 executable: executable,
-                arguments: arguments(for: agent, prompt: prompt(for: patches),
+                arguments: arguments(for: agent, prompt: prompt(for: patches, repositories: repositories),
+                                     addDirectories: repositories.dropFirst().map(\.root),
+                                     codexServers: codexServers,
                                      copilotServers: agent == .copilot ? copilotServers() : []),
                 currentDirectory: URL(fileURLWithPath: directory),
                 environment: environment,
