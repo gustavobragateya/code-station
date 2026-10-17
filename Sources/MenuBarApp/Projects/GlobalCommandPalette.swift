@@ -6,6 +6,7 @@ import SwiftUI
 final class GlobalCommandPaletteController {
     var isPresented = false
     private(set) var newSessionRequest = 0
+    private(set) var sidebarFocusRequest = 0
 
     func open() {
         isPresented = true
@@ -13,6 +14,11 @@ final class GlobalCommandPaletteController {
 
     func close() {
         isPresented = false
+    }
+
+    func dismiss() {
+        close()
+        sidebarFocusRequest += 1
     }
 
     func requestNewSession() {
@@ -160,7 +166,7 @@ struct GlobalCommandPalette: View {
     let openSettings: () -> Void
 
     @State private var query = ""
-    @State private var category = GlobalCommandCategory.projects
+    @State private var category = GlobalCommandCategory.all
     @State private var selected: GlobalCommandDestination?
     // Kept apart from `selected` because hover must not scroll: scrolling slides
     // another row under the mouse, which would hover it and scroll again.
@@ -188,8 +194,15 @@ struct GlobalCommandPalette: View {
         .overlay(RoundedRectangle(cornerRadius: 15).stroke(Theme.settingsBorder))
         .shadow(color: .black.opacity(0.22), radius: 28, y: 10)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Filter Code Station")
+        .accessibilityLabel("Search Code Station")
         .accessibilityAddTraits(.isModal)
+        .background {
+            Button("", action: clearOrDismiss)
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
         .task {
             resultWindow.reset()
             selected = results.first?.destination
@@ -208,12 +221,13 @@ struct GlobalCommandPalette: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.tertiary)
-            TextField("Filter projects, sessions, and actions", text: $query)
+            TextField("Search projects, sessions, and actions", text: $query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 15))
                 .focused($searchFocused)
+                .accessibilityLabel("Search Code Station")
                 .onSubmit { activateSelection() }
-                .onExitCommand { controller.close() }
+                .onExitCommand(perform: clearOrDismiss)
                 .onKeyPress(.downArrow) {
                     moveSelection(by: 1)
                     return .handled
@@ -222,6 +236,17 @@ struct GlobalCommandPalette: View {
                     moveSelection(by: -1)
                     return .handled
                 }
+            if !query.isEmpty {
+                Button(action: clearSearch) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .sidebarFocusRing()
+                .accessibilityLabel("Clear search")
+            }
             Text("ESC")
                 .font(.mono(9))
                 .foregroundStyle(.tertiary)
@@ -253,11 +278,16 @@ struct GlobalCommandPalette: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 if results.isEmpty {
-                    Text("No matching projects, sessions, or actions.")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 44)
-                        .frame(maxWidth: .infinity)
+                    VStack(spacing: 12) {
+                        Text("No matching projects, sessions, or actions.")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        if !query.isEmpty {
+                            InlineLink(title: "Clear search", action: clearSearch)
+                        }
+                    }
+                    .padding(.vertical, 44)
+                    .frame(maxWidth: .infinity)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(GlobalCommandGroup.allCases, id: \.self) { group in
@@ -406,7 +436,7 @@ struct GlobalCommandPalette: View {
         HStack(spacing: 16) {
             keyHint("↑↓", "move")
             keyHint("↵", "open")
-            keyHint("esc", "close")
+            keyHint("esc", query.isEmpty ? "close" : "clear")
             Spacer(minLength: 0)
             Text("⌘K from anywhere")
         }
@@ -428,6 +458,16 @@ struct GlobalCommandPalette: View {
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(Theme.border))
             Text(label)
         }
+    }
+
+    private func clearSearch() {
+        query = ""
+        searchFocused = true
+    }
+
+    private func clearOrDismiss() {
+        if query.isEmpty { controller.dismiss() }
+        else { clearSearch() }
     }
 
     private func resetResults() {

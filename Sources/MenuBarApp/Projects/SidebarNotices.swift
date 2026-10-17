@@ -107,54 +107,95 @@ struct SidebarBrandBar: View {
     let selectHome: () -> Void
     let noticeMenu: () -> [MenuEntry]
 
+    @Environment(\.textScale) private var textScale
     @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: selectHome) {
-                HStack(spacing: 9) {
-                    AppMark()
-                        .frame(width: 26, height: 26)
-                    Text("Teya Code Station")
-                        .font(.logo(18))
-                        .kerning(-0.2)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(isHome || hovering ? Theme.card : Color.clear))
-                .overlay(RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHome ? Theme.border : Color.clear, lineWidth: 1.3))
-                .contentShape(RoundedRectangle(cornerRadius: 8))
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                homeButton
+                Spacer(minLength: 0)
+                statusButtons
             }
-            .buttonStyle(.plain)
-            .padding(.leading, -6)
-            .onHover { hovering = $0 }
-            .appTooltip("Home")
-
-            Spacer(minLength: 4)
-
-            if runningCount > 0 {
-                HStack(spacing: 5) {
-                    RunningDot()
-                    Text("\(runningCount)")
-                        .font(.mono(9.5, .semibold))
-                        .kerning(0.7)
-                        .foregroundStyle(Theme.accent)
+            VStack(alignment: .leading, spacing: 8) {
+                homeButton
+                HStack {
+                    Spacer(minLength: 0)
+                    statusButtons
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 4)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.accent.opacity(0.1)))
-                .appMenu(noticeMenu)
-                .appTooltip("Show active and unread sessions")
             }
-
-            MobileAccessBadge()
         }
         .padding(.horizontal, 14)
-        .headerBand(Theme.sidebar)
+        .padding(.vertical, 12)
+        .frame(minHeight: 68)
+    }
+
+    private var homeButton: some View {
+        Button(action: selectHome) {
+            HStack(spacing: 9) {
+                AppMark()
+                    .frame(width: 41, height: 41)
+                    .frame(width: 33, height: 33)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Teya")
+                        .font(.logo(9 * max(1, textScale), weight: 500))
+                        .foregroundStyle(.secondary)
+                    Text("Code Station")
+                        .font(.logo(15 * max(1, textScale)))
+                        .kerning(-0.55)
+                }
+                .fixedSize()
+            }
+            .padding(5)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(isHome || hovering ? Theme.field : .clear))
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, -5)
+        .onHover { hovering = $0 }
+        .sidebarFocusRing()
+        .accessibilityLabel("Teya Code Station home")
+        .accessibilityAddTraits(isHome ? .isSelected : [])
+        .appTooltip("Home")
+    }
+
+    private var statusButtons: some View {
+        HStack(spacing: 6) {
+            if runningCount > 0 {
+                SidebarRunningLabel(count: runningCount)
+                    .appMenu(showsFocusRing: true, noticeMenu)
+                    .accessibilityLabel("\(runningCount) running sessions")
+                    .appTooltip("Show active and unread sessions")
+            }
+            MobileAccessBadge()
+        }
+        .fixedSize()
+    }
+}
+
+private struct SidebarRunningLabel: View {
+    let count: Int
+
+    @Environment(\.menuIsOpen) private var isOpen
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            RunningDot(size: 5)
+            Text("\(count) running")
+                .font(.system(size: 9.5, weight: .semibold))
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .medium))
+        }
+        .foregroundStyle(Theme.accent)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(Theme.accent.opacity(isOpen || hovering ? 0.13 : 0.065)))
+        .overlay(Capsule().stroke(Theme.accent.opacity(isOpen || hovering ? 0.25 : 0.12)))
+        .contentShape(Capsule())
+        .onHover { hovering = $0 }
     }
 }
 

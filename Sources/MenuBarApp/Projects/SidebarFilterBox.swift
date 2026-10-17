@@ -90,39 +90,54 @@ struct SidebarFilterBar: View {
     // somewhere else reads as a broken shortcut rather than as one being shared.
     let showsShortcutHint: Bool
 
+    @Environment(GlobalCommandPaletteController.self) private var commandPalette
+    @FocusState private var commandFocused: Bool
+    @State private var hovering = false
+
     var body: some View {
         Group {
             if box.showsField { field } else { commandPaletteButton }
         }
         .padding(.horizontal, 14)
-        .padding(.bottom, 10)
+        .onChange(of: commandPalette.sidebarFocusRequest) { _, _ in
+            if box.showsField { focused = true }
+            else { commandFocused = true }
+        }
     }
 
     private var commandPaletteButton: some View {
         Button(action: openCommandPalette) {
-            HStack(spacing: 7) {
+            HStack(spacing: 9) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                Text("Filter projects, sessions, actions")
-                    .font(.system(size: 12.5))
+                    .font(.system(size: 14))
+                    .foregroundStyle(Theme.accent)
+                Text("Search Code Station")
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 4)
-                Text("⌘K")
-                    .font(.mono(9.5))
-                    .foregroundStyle(.tertiary)
+                Text("⌘ K")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 3)
+                    .surface(Theme.sunken, cornerRadius: 4)
+                    .accessibilityHidden(true)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .fieldSurface(cornerRadius: 9)
+            .frame(height: 38)
+            .surface(Theme.card, cornerRadius: 9,
+                     border: hovering ? Theme.accent.opacity(0.45) : Theme.border)
             .contentShape(RoundedRectangle(cornerRadius: 9))
         }
         .buttonStyle(.plain)
+        .sidebarFocusRing($commandFocused)
+        .onHover { hovering = $0 }
         .hoverLift()
-        .accessibilityLabel("Filter projects, sessions, and actions")
-        .appTooltip("Filter Code Station (command-K)")
+        .accessibilityLabel("Search Code Station")
+        .accessibilityHint("Search projects, sessions, and actions. Command-K.")
+        .appTooltip("Search Code Station (command-K)")
     }
 
     private var field: some View {
@@ -134,28 +149,42 @@ struct SidebarFilterBar: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 12.5))
                 .focused($focused)
+                .accessibilityLabel("Filter projects and sessions")
+                .onExitCommand(perform: closeOrClear)
             if showsShortcutHint {
                 Text("⌘F")
                     .font(.mono(9.5))
                     .foregroundStyle(.tertiary)
             }
-            Button {
-                let wasEmpty = box.text.isEmpty
-                box.closeOrClear()
-                if wasEmpty { focused = false }
-            } label: {
+            Button(action: closeOrClear) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .sidebarFocusRing()
             .hoverLift(amount: Motion.smallLift)
+            .accessibilityLabel(box.text.isEmpty ? "Close sidebar filter" : "Clear sidebar filter")
             .appTooltip(box.text.isEmpty ? "Close project filter" : "Clear filter")
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .frame(height: 38)
         .fieldSurface(cornerRadius: 9)
+        .overlay(RoundedRectangle(cornerRadius: 9)
+            .stroke(focused ? Theme.accent : .clear, lineWidth: 2)
+            .allowsHitTesting(false))
         .onChange(of: box.text) { _, _ in box.typed() }
+    }
+
+    private func closeOrClear() {
+        let wasEmpty = box.text.isEmpty
+        box.closeOrClear()
+        if wasEmpty {
+            focused = false
+            commandFocused = true
+        } else {
+            focused = true
+        }
     }
 }
