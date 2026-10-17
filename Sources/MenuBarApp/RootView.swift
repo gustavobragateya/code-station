@@ -165,10 +165,6 @@ struct RootView: View {
             Button("") { store.goForward() }
                 .keyboardShortcut("]", modifiers: .command)
                 .disabled(!canNavigateHistory || !store.canGoForward)
-            if commandPalette.isPresented {
-                Button("") { commandPalette.close() }
-                    .keyboardShortcut(.escape, modifiers: [])
-            }
             // Growing the text is Cmd+ in the View menu, which AppKit only matches on a
             // shifted key. The unshifted key most people actually press is the same command,
             // so it is answered here rather than as a second line in the menu saying the same
@@ -190,7 +186,7 @@ struct RootView: View {
             ZStack(alignment: .top) {
                 Color.black.opacity(0.17)
                     .contentShape(Rectangle())
-                    .onTapGesture { commandPalette.close() }
+                    .onTapGesture { commandPalette.dismiss() }
 
                 GlobalCommandPalette(openSettings: {
                     commandPalette.close()

@@ -74,17 +74,19 @@ enum ProjectGrouping: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .flat: "None"
-        case .kind: "By Type"
+        case .flat: "Ungrouped"
+        case .kind: "By type"
         }
     }
 
     var hint: String {
         switch self {
-        case .flat: "One list with everything in it"
-        case .kind: "Tasks, workspaces, and projects under their own headings"
+        case .flat: "Everything in one list"
+        case .kind: "Tasks, workspaces and projects"
         }
     }
+
+    var icon: String { self == .flat ? "list.bullet" : "square.grid.2x2" }
 
     func sections(of items: [SidebarItem]) -> [SidebarSection] {
         switch self {
@@ -110,17 +112,19 @@ enum ProjectSort: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .name: "A-Z"
+        case .name: "Name, A to Z"
         case .lastUsed: "Last used"
         }
     }
 
     var hint: String {
         switch self {
-        case .name: "Sort projects and workspaces by name"
-        case .lastUsed: "Sort projects and workspaces by their newest session"
+        case .name: "Find a project by its name"
+        case .lastUsed: "Pick up where you left off"
         }
     }
+
+    var icon: String { self == .name ? "textformat.abc" : "clock" }
 
     func apply(to items: [SidebarItem], sessions: [ChatSession]) -> [SidebarItem] {
         let pinned = Self.pinnedIDs(of: items, sessions: sessions)
