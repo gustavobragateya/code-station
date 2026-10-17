@@ -100,10 +100,20 @@ final class ChangesNavigationMemory {
     // The navigator lists the review instead of the files. Kept here, with the comment in
     // focus, because each project gets a screen of its own and stepping through a review
     // moves between them.
-    var showingReview = false
+    var list = NavigatorList.files
     var reviewFilter = ReviewFilter.all
     var focusedComment: UUID?
     var secondOpinionFocus = Set(SecondOpinion.Focus.standard)
+
+    var showingReview: Bool {
+        get { list == .review }
+        set { list = newValue ? .review : .files }
+    }
+
+    var showingQuestions: Bool {
+        get { list == .questions }
+        set { list = newValue ? .questions : .files }
+    }
 
     func history(for root: String) -> CommitHistorySelection {
         if let selection = histories[root] { return selection }
@@ -123,6 +133,11 @@ struct ChangesRepository: Identifiable {
         guard snapshot.state == .ready else { return "Unavailable" }
         return snapshot.files.isEmpty ? "Clean" : "\(snapshot.files.count) changed"
     }
+}
+
+// What the navigator lists: the changed files, the review, or the questions asked here.
+enum NavigatorList: Hashable {
+    case files, review, questions
 }
 
 // Which comments the review list shows.
@@ -153,6 +168,16 @@ struct ReviewTarget {
     var send: (String) -> Void = { _ in }
     // Goes back to the conversation, to watch the agent take a sent review up.
     var openChat: () -> Void = {}
+    // What a side copy needs from the session to answer a question.
+    var conversation: () -> ReviewConversation? = { nil }
+}
+
+// The session as a side copy sees it: the folder it runs in, Claude's id for its
+// conversation, and the latest turns as text for an agent that cannot fork it.
+struct ReviewConversation {
+    var directory: String
+    var claudeSessionID: String?
+    var recentChat: String
 }
 
 // A comment being written or edited, and the lines it is about.
@@ -164,7 +189,8 @@ struct CommentDraft: Equatable {
     var excerpt = ""
     var excerptOffsets: [Int]?
     var text = ""
-    var kind = ReviewComment.Kind.change
+    // A new note starts as a question, which is answered here and sends nothing.
+    var kind = ReviewComment.Kind.question
     // The comment being edited, or nil for a new one.
     var editing: UUID?
 }
@@ -228,6 +254,11 @@ struct ChangesView: View {
         get { navigation.showingReview }
         nonmutating set { navigation.showingReview = newValue }
     }
+    private var showingQuestions: Bool {
+        get { navigation.showingQuestions }
+        nonmutating set { navigation.showingQuestions = newValue }
+    }
+    @State private var wholeQuestion = ""
     private var reviewFilter: ReviewFilter {
         get { navigation.reviewFilter }
         nonmutating set { navigation.reviewFilter = newValue }
@@ -708,10 +739,16 @@ struct ChangesView: View {
                 let count = review.reviews.comments(review.sessionID).count + open
                 let pending = !review.reviews.pending(review.sessionID).isEmpty
                 let unread = review.reviews.unreadCount(review.sessionID) > 0
+                let asked = review.reviews.questions(review.sessionID)
+                let answering = asked.contains { $0.status == .answering }
                 HStack(spacing: 4) {
-                    ChoicePill(title: "Files \(navigatorFileCount)", selected: !showingReview) { showingReview = false }
+                    ChoicePill(title: "Files \(navigatorFileCount)", selected: navigation.list == .files) {
+                        navigation.list = .files
+                    }
                     ChoicePill(title: count > 0 ? "Review \(count)" : "Review", selected: showingReview,
                                dot: pending ? Theme.attention : unread ? Theme.plan : nil) { showingReview = true }
+                    ChoicePill(title: asked.isEmpty ? "Questions" : "Questions \(asked.count)", selected: showingQuestions,
+                               dot: answering ? Theme.plan : nil) { showingQuestions = true }
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 12).padding(.top, 12)
@@ -720,6 +757,8 @@ struct ChangesView: View {
             }
             if mode == .changes, showingReview, let review {
                 reviewNavigator(review)
+            } else if mode == .changes, showingQuestions, let review {
+                questionsNavigator(review)
             } else {
                 filesNavigator
             }
@@ -1274,6 +1313,13 @@ struct ChangesView: View {
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(pending ? Theme.attentionText : Theme.accent)
                         .appTooltip(counted(comments.count, "review comment") + (pending ? ", some still to look at" : ""))
+                    }
+                    let asked = review.reviews.questions(review.sessionID, root: repoRoot, path: file.path).count { !$0.resolved }
+                    if asked > 0 {
+                        Label("\(asked)", systemImage: "questionmark.bubble")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(Theme.plan)
+                            .appTooltip(counted(asked, "question") + ", answered here")
                     }
                 }
 
@@ -1930,7 +1976,40 @@ struct ChangesView: View {
 
     private var openFileComments: [ReviewComment] {
         guard let review, let file = selected else { return [] }
-        return review.reviews.comments(review.sessionID, root: repoRoot, path: file.path)
+        return inlineComments(review, path: file.path)
+    }
+
+    // A change made from a question's answer is drawn inside the question's thread, so it
+    // is left out of the cards while the question is still there.
+    private func inlineComments(_ review: ReviewTarget, path: String) -> [ReviewComment] {
+        let asked = Set(review.reviews.questions(review.sessionID).map(\.id))
+        return review.reviews.comments(review.sessionID, root: repoRoot, path: path)
+            .filter { $0.questionID.map { !asked.contains($0) } ?? true }
+    }
+
+    private var openFileQuestions: [ReviewQuestion] {
+        guard let review, let file = selected else { return [] }
+        return review.reviews.questions(review.sessionID, root: repoRoot, path: file.path)
+    }
+
+    private var questionPlacement: [Int: [ReviewQuestion]] {
+        guard let diff else { return [:] }
+        return Self.placeQuestions(openFileQuestions, in: diff.lines)
+    }
+
+    // Questions hang under their lines the way comments do. One whose code has left the
+    // diff is still in the Questions list.
+    static func placeQuestions(_ questions: [ReviewQuestion], in lines: [DiffLine]) -> [Int: [ReviewQuestion]] {
+        guard !questions.isEmpty else { return [:] }
+        let numbered = NumberedDiffLine.lines(lines)
+        var below: [Int: [ReviewQuestion]] = [:]
+        for question in questions.sorted(by: { $0.created < $1.created }) where !question.isWhole {
+            if let found = ReviewPlacement.locate(question.anchor, excerpt: question.excerpt,
+                                                  excerptOffsets: question.excerptOffsets, in: numbered) {
+                below[found.lastID, default: []].append(question)
+            }
+        }
+        return below
     }
 
     private var placement: ReviewPlacement {
@@ -1968,8 +2047,9 @@ struct ChangesView: View {
 
     // The lines a thread hangs from: those with comments placed under them, and the one a
     // comment is being written about.
-    private func threadLines(placement: ReviewPlacement, sent: ReviewPlacement, lines: [DiffLine]) -> Set<Int> {
-        var ids = Set(placement.below.keys).union(sent.below.keys)
+    private func threadLines(placement: ReviewPlacement, sent: ReviewPlacement, asked: [Int: [ReviewQuestion]],
+                             lines: [DiffLine]) -> Set<Int> {
+        var ids = Set(placement.below.keys).union(sent.below.keys).union(asked.keys)
         if let draft = commentDraft, draft.path == selected?.path, draft.editing == nil,
            let id = lineID(for: draft.anchor, in: lines) {
             ids.insert(id)
@@ -1979,15 +2059,17 @@ struct ChangesView: View {
 
     private var threadLineIDs: Set<Int> {
         guard review != nil, mode == .changes, let diff else { return [] }
-        return threadLines(placement: placement, sent: sentPlacement, lines: diff.lines)
+        return threadLines(placement: placement, sent: sentPlacement, asked: questionPlacement, lines: diff.lines)
     }
 
     private func diffComments(for file: GitChange?, lines: [DiffLine]) -> DiffComments? {
         guard let review else { return nil }
-        let comments = file.map { review.reviews.comments(review.sessionID, root: repoRoot, path: $0.path) } ?? []
+        let comments = file.map { inlineComments(review, path: $0.path) } ?? []
         let sent = file.map { review.reviews.threads(review.sessionID, root: repoRoot, path: $0.path).map(\.comment) } ?? []
+        let asked = file.map { review.reviews.questions(review.sessionID, root: repoRoot, path: $0.path) } ?? []
         return DiffComments(threads: threadLines(placement: ReviewPlacement.place(comments, in: lines),
-                                                 sent: ReviewPlacement.place(sent, in: lines), lines: lines))
+                                                 sent: ReviewPlacement.place(sent, in: lines),
+                                                 asked: Self.placeQuestions(asked, in: lines), lines: lines))
     }
 
     // What hangs under each line: its cards, and the composer where one is being written.
@@ -1996,6 +2078,7 @@ struct ChangesView: View {
         guard let diff else { return [:] }
         let placement = placement
         let sent = sentPlacement
+        let asked = questionPlacement
         let rounds = Dictionary(openFileThreads.map { ($0.comment.id, $0.round) }, uniquingKeysWith: { first, _ in first })
         var views: [Int: AnyView] = [:]
         let draftLine: Int? = {
@@ -2005,10 +2088,13 @@ struct ChangesView: View {
             }
             return lineID(for: draft.anchor, in: diff.lines)
         }()
-        for id in threadLines(placement: placement, sent: sent, lines: diff.lines) {
+        for id in threadLines(placement: placement, sent: sent, asked: asked, lines: diff.lines) {
             let comments = placement.below[id] ?? []
             let threads = (sent.below[id] ?? []).compactMap { comment in rounds[comment.id].map { ($0, comment) } }
             views[id] = AnyView(VStack(alignment: .leading, spacing: 8) {
+                ForEach(asked[id] ?? []) { question in
+                    questionThread(question, review: review)
+                }
                 ForEach(threads, id: \.1.id) { round, comment in
                     thread(comment, round: round, review: review)
                 }
@@ -2029,6 +2115,7 @@ struct ChangesView: View {
         guard let focusedComment,
               let line = placement.below.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
                 ?? sentPlacement.below.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
+                ?? questionPlacement.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
         else { return nil }
         return DiffReveal(line: line, serial: revealSerial)
     }
@@ -2088,6 +2175,8 @@ struct ChangesView: View {
                 agentTitle: review.agent.title,
                 action: finding != nil ? "Keep with my edits" : editing == nil ? "Add comment" : "Save",
                 stretches: editing == nil,
+                place: place(root: repoRoot, path: draft.path, anchor: draft.anchor),
+                forksConversation: review.agent == .claudeCode,
                 onDelete: editing != nil && finding == nil ? { if let editing { deleteComment(editing) } } : nil,
                 onSave: saveComment,
                 onCancel: { commentDraft = nil })
@@ -2184,13 +2273,21 @@ struct ChangesView: View {
                 return
             }
             announce("Comment saved")
+        } else if draft.kind == .question {
+            let question = ReviewQuestion(root: repoRoot, path: draft.path, anchor: draft.anchor, excerpt: draft.excerpt,
+                                          excerptOffsets: draft.excerptOffsets, agent: review.agent,
+                                          question: draft.text.trimmed)
+            review.reviews.ask(question, context: questionContext(review), in: review.sessionID)
+            commentDraft = nil
+            focusedComment = question.id
+            announce("Asked. The answer appears under the lines and stays here.")
         } else {
             review.reviews.add(ReviewComment(root: repoRoot, path: draft.path, anchor: draft.anchor,
                                              excerpt: draft.excerpt, body: draft.text.trimmed,
                                              excerptOffsets: draft.excerptOffsets, kind: draft.kind),
                                to: review.sessionID)
             commentDraft = nil
-            announce("Comment added")
+            announce("Added to your review")
         }
     }
 
@@ -2373,8 +2470,8 @@ struct ChangesView: View {
     // The first time the diff takes comments, a note says how.
     private var coachMark: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Comment on any line").font(.system(size: 12.5, weight: .semibold))
-            Text("Click a line number to leave a note for \(review?.agent.title ?? "the agent"). Drag down the numbers to cover several lines. Everything waits here until you send it.")
+            Text("Ask or comment on any line").font(.system(size: 12.5, weight: .semibold))
+            Text("Click a line number to ask a question or request a change. Drag down the numbers to cover several lines. Questions are answered here; changes wait until you send them to \(review?.agent.title ?? "the agent").")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -2399,6 +2496,7 @@ struct ChangesView: View {
         let unplaced = placement.unplaced.count
         let sent = review.reviews.threads(review.sessionID).count
         let unread = review.reviews.unreadCount(review.sessionID)
+        let asked = review.reviews.questions(review.sessionID).count
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Label("Your review", systemImage: "text.bubble.fill")
@@ -2416,8 +2514,8 @@ struct ChangesView: View {
                         .appTooltip("Open the next reply")
                     }
                     if sent > 0 { Text("\(sent) sent").lineLimit(1) }
-                    Text(!kept.isEmpty ? "\(counted(kept.count, "comment")) on \(counted(fileCount, "file"))"
-                         : all.isEmpty ? "Click a line number, or drag down several, to comment" : "Nothing kept yet")
+                    Text(!kept.isEmpty ? "On \(counted(fileCount, "file")). Changes wait here until you send them"
+                         : all.isEmpty ? "Click a line number to ask or comment" : "Nothing kept yet")
                         .lineLimit(1)
                     if pending > 0 {
                         Button(action: nextPending) {
@@ -2443,6 +2541,14 @@ struct ChangesView: View {
                 .foregroundStyle(.secondary)
             }
             .layoutPriority(1)
+            reviewCount(count: kept.count, text: kept.count == 1 ? "change to send" : "changes to send",
+                        icon: "pencil", tint: Theme.accent, help: "Goes to \(review.agent.title) when you send") {
+                showingReview = true
+            }
+            reviewCount(count: asked, text: asked == 1 ? "question stays here" : "questions stay here",
+                        icon: "eye.slash", tint: Theme.plan, help: "Answered here. Never sent to \(review.agent.title)") {
+                showingQuestions = true
+            }
             Spacer(minLength: 8)
             ForEach(review.reviews.runs(review.sessionID)) { run in
                 ReviewLane(run: run,
@@ -2463,6 +2569,10 @@ struct ChangesView: View {
             if !all.isEmpty {
                 InlineLink(title: "Clear", tint: Color.secondary) { confirmClear(review, kept: kept.count, pending: pending) }
             }
+            InlineLink(title: "Preview message", tint: Color.secondary) { previewSend(review, startsOnMessage: true) }
+                .disabled(kept.isEmpty)
+                .opacity(kept.isEmpty ? 0.5 : 1)
+                .appTooltip("The exact message \(review.agent.title) gets")
             ActionButton(title: kept.isEmpty ? "Send to \(review.agent.title)"
                          : "Send \(counted(kept.count, "comment")) to \(review.agent.title)",
                          tone: .green, height: 28, size: 12, icon: "paperplane.fill") { previewSend(review) }
@@ -2472,6 +2582,27 @@ struct ChangesView: View {
         .padding(.horizontal, 20).padding(.vertical, 8)
         .background(Theme.card)
         .overlay(alignment: .top) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+    }
+
+    // A count in the review bar that says where things go, in words as well as colour.
+    private func reviewCount(count: Int, text: String, icon: String, tint: Color, help: String,
+                             open: @escaping () -> Void) -> some View {
+        Button(action: open) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+                Text("\(count)").fontWeight(.bold)
+                Text(text)
+            }
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(count > 0 ? tint : Color.secondary)
+            .padding(.horizontal, 9).frame(height: 24)
+            .background(Capsule().fill((count > 0 ? tint : Color.secondary).opacity(0.1)))
+            .contentShape(Capsule())
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .appTooltip(help)
+        .accessibilityLabel("\(count) \(text)")
     }
 
     // The first thread with an answer not yet read, in the order the review list shows.
@@ -2608,14 +2739,28 @@ struct ChangesView: View {
     }
 
     private func fileLabel(_ comment: ReviewComment) -> String {
-        let name = (comment.path as NSString).lastPathComponent
-        guard repositories.count > 1 else { return name }
-        return (projectNames[comment.root] ?? (comment.root as NSString).lastPathComponent) + " · " + name
+        fileLabel(root: comment.root, path: comment.path)
     }
 
-    private func previewSend(_ review: ReviewTarget) {
+    private func fileLabel(root: String, path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        guard repositories.count > 1 else { return name }
+        return (projectNames[root] ?? (root as NSString).lastPathComponent) + " · " + name
+    }
+
+    // The project, file and lines a question or a new note is about, as its band names them.
+    private func place(root: String, path: String, anchor: DiffAnchor?) -> String {
+        let project = projectNames[root] ?? (root as NSString).lastPathComponent
+        guard let anchor, !path.isEmpty else { return project + " · whole change" }
+        let lines = anchor.lastLine.map { "\(anchor.line)–\($0)" } ?? "\(anchor.line)"
+        return project + " · " + (path as NSString).lastPathComponent + " " + lines + (anchor.side == .old ? " (removed)" : "")
+    }
+
+    private func previewSend(_ review: ReviewTarget, startsOnMessage: Bool = false) {
         let kept = ReviewOrder.sorted(review.reviews.kept(review.sessionID), roots: repositories.map(\.root))
         guard !kept.isEmpty else { return }
+        let carried = Set(kept.filter { $0.why != nil }.compactMap(\.questionID))
+        let leftOut = review.reviews.questions(review.sessionID).count { !carried.contains($0.id) }
         let names = projectNames
         let busy = review.isBusy()
         dialogs.show(Dialog(
@@ -2624,6 +2769,7 @@ struct ChangesView: View {
             content: AnyView(SendReviewSheet(
                 agentTitle: review.agent.title, comments: kept,
                 pendingCount: review.reviews.pending(review.sessionID).count, busy: busy,
+                questionsLeftOut: leftOut, startsOnMessage: startsOnMessage,
                 fileName: fileLabel,
                 prompt: { ReviewPrompt.feedback($0, projectNames: names, note: $1) },
                 lookFirst: {
@@ -2646,9 +2792,227 @@ struct ChangesView: View {
         review.send(prompt)
         if let editing = commentDraft?.editing, comments.contains(where: { $0.id == editing }) { commentDraft = nil }
         focusedComment = nil
-        showToast(busy ? "\(counted(comments.count, "comment")) queued for \(review.agent.title)"
-                       : "Sent \(counted(comments.count, "comment")) to \(review.agent.title)",
+        let asked = review.reviews.questions(review.sessionID).count
+        let stayed = asked == 0 ? "" : asked == 1 ? ". 1 question stayed here" : ". \(asked) questions stayed here"
+        showToast((busy ? "\(counted(comments.count, "comment")) queued for \(review.agent.title)"
+                        : "Sent \(counted(comments.count, "comment")) to \(review.agent.title)") + stayed,
                   action: "Open Chat", perform: review.openChat)
+    }
+
+    // MARK: Questions
+
+    private func questionContext(_ review: ReviewTarget) -> QuestionContext {
+        let conversation = review.conversation()
+        return QuestionContext(agent: review.agent, executable: review.executable(review.agent),
+                               directory: conversation?.directory ?? repoRoot,
+                               repositories: reviewRepositories,
+                               conversationID: conversation?.claudeSessionID,
+                               recentChat: conversation?.recentChat ?? "")
+    }
+
+    private func questionThread(_ question: ReviewQuestion, review: ReviewTarget, showsBand: Bool = true) -> some View {
+        let focused = focusedComment == question.id
+        let reviews = review.reviews
+        let sessionID = review.sessionID
+        let waiting = question.changeID.flatMap { reviews.comment($0, in: sessionID) }
+        let round = waiting == nil ? question.changeID.flatMap { reviews.round(sending: $0, in: sessionID) } : nil
+        let sent = round?.comments.first { $0.id == question.changeID }
+        return QuestionThreadView(
+            question: question,
+            place: place(root: question.root, path: question.path, anchor: question.isWhole ? nil : question.anchor),
+            steps: reviews.questionSteps[question.id] ?? [],
+            showsBand: showsBand, focused: focused,
+            projectPath: repoRoot, textScale: appSettings.textSize.scale,
+            change: waiting ?? sent, changeSent: sent == nil ? nil : round?.sent,
+            followUp: {
+                reviews.followUp($0, to: question.id, context: questionContext(review), in: sessionID)
+                announce("Asked a follow-up")
+            },
+            resolve: {
+                reviews.setResolved(question.id, true, in: sessionID)
+                announce("Resolved")
+            },
+            reopen: { reviews.setResolved(question.id, false, in: sessionID) },
+            retry: { reviews.retryQuestion(question.id, context: questionContext(review), in: sessionID) },
+            delete: {
+                reviews.deleteQuestion(question.id, in: sessionID)
+                if focusedComment == question.id { focusedComment = nil }
+                announce("Question deleted")
+            },
+            makeChange: question.isWhole ? nil : {
+                reviews.makeChange(from: question.id, in: sessionID)
+                showToast("Added a change to your review. It goes to \(review.agent.title) when you send.")
+            },
+            takeOut: {
+                reviews.takeOutOfReview(question.id, in: sessionID)
+                announce("Taken out of the review")
+            },
+            editChange: { text in
+                if let id = question.changeID { reviews.update(id, body: text, in: sessionID) }
+            },
+            sendsQuestion: { on in
+                if let id = question.changeID { reviews.setSendsQuestion(on, change: id, in: sessionID) }
+            })
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(focused ? Theme.plan : Theme.border, lineWidth: focused ? 2 : 1))
+            .onTapGesture { focusedComment = question.id }
+    }
+
+    // Puts a question in focus and brings it on screen. One about the whole change has no
+    // lines, so it opens in the list instead.
+    private func focus(_ question: ReviewQuestion) {
+        focusedComment = question.id
+        revealSerial += 1
+        guard !question.isWhole else { return }
+        guard question.root == repoRoot else {
+            selectRepository(question.root, question.path)
+            return
+        }
+        if selected?.path != question.path, let file = files.first(where: { $0.path == question.path }) {
+            mode = .changes
+            select(file)
+        }
+        announce(question.spokenName)
+    }
+
+    private func askAboutWholeChange(_ review: ReviewTarget) {
+        guard !wholeQuestion.isBlank else { return }
+        let question = ReviewQuestion.whole(root: repoRoot, agent: review.agent, question: wholeQuestion.trimmed)
+        review.reviews.ask(question, context: questionContext(review), in: review.sessionID)
+        wholeQuestion = ""
+        focusedComment = question.id
+        announce("Asked. The answer appears in this list and stays here.")
+    }
+
+    @ViewBuilder private func questionsNavigator(_ review: ReviewTarget) -> some View {
+        let asked = review.reviews.questions(review.sessionID).sorted { $0.created > $1.created }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    wholeChangeBox(review)
+                    groupHeader("Asked in this review", count: asked.count)
+                    if asked.isEmpty {
+                        VStack(spacing: 6) {
+                            Text("No questions yet").font(.system(size: 12.5, weight: .semibold))
+                            Text("Click a line number and choose Ask a question. The answer comes here, never in the chat.")
+                        }
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity).padding(.vertical, 24).padding(.horizontal, 12)
+                    }
+                    ForEach(asked) { question in
+                        Group {
+                            if question.isWhole && focusedComment == question.id {
+                                questionThread(question, review: review, showsBand: false)
+                            } else {
+                                questionItem(question, review: review)
+                            }
+                        }
+                        .id(question.id)
+                    }
+                }
+                .padding(10)
+            }
+            .onChange(of: focusedComment) { _, id in
+                if let id { proxy.scrollTo(id) }
+            }
+        }
+    }
+
+    private func wholeChangeBox(_ review: ReviewTarget) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Ask about the whole change").font(.system(size: 12.5, weight: .semibold))
+            TextField("For example: why does each plugin get its own folder?", text: $wholeQuestion, axis: .vertical)
+                .lineLimit(1...4)
+                .appTextField()
+                .onSubmit { askAboutWholeChange(review) }
+                .accessibilityLabel("Question about the whole change")
+            HStack(spacing: 8) {
+                Label("Answered here, never in the chat", systemImage: "eye.slash")
+                    .font(.system(size: 11)).foregroundStyle(Theme.plan)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                ActionButton(title: "Ask", tone: .plan, height: 26, size: 11.5, icon: "questionmark") {
+                    askAboutWholeChange(review)
+                }
+                .disabled(wholeQuestion.isBlank)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.plan.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.plan.opacity(0.25)))
+    }
+
+    // A question in the list: where it is, where it stands, and the start of its answer.
+    private func questionItem(_ question: ReviewQuestion, review: ReviewTarget) -> some View {
+        let isFocused = focusedComment == question.id
+        let lines = question.lastLine.map { "\(question.line)–\($0)" } ?? "\(question.line)"
+        return VStack(alignment: .leading, spacing: 6) {
+            Button { focus(question) } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(question.isWhole ? "Whole change" : fileLabel(root: question.root, path: question.path) + " " + lines)
+                            .font(.mono(10.5)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 4)
+                        questionBadge(question, review: review)
+                    }
+                    Text(question.text).font(.system(size: 12, weight: .semibold)).lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    switch question.status {
+                    case .answering:
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text(review.reviews.questionSteps[question.id]?.last ?? "Starting").lineLimit(1)
+                        }
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    case .failed:
+                        Text(question.failure ?? "").font(.system(size: 11.5)).foregroundStyle(Theme.warningText).lineLimit(2)
+                    case .answered:
+                        ReviewText(text: question.exchanges.last?.answer ?? "", size: 11.5, lineLimit: 3)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(question.spokenName)
+            .accessibilityAddTraits(isFocused ? .isSelected : [])
+            if question.status == .failed {
+                HStack(spacing: 12) {
+                    InlineLink(title: "Try again", size: 11.5) {
+                        review.reviews.retryQuestion(question.id, context: questionContext(review), in: review.sessionID)
+                    }
+                    InlineLink(title: "Delete", size: 11.5, tint: Theme.deletion) {
+                        review.reviews.deleteQuestion(question.id, in: review.sessionID)
+                        announce("Question deleted")
+                    }
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(isFocused ? Theme.plan.opacity(0.08) : .clear))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(isFocused ? Theme.plan.opacity(0.3) : .clear))
+        .hoverFill(cornerRadius: 8)
+        .opacity(question.resolved ? 0.7 : 1)
+    }
+
+    private func questionBadge(_ question: ReviewQuestion, review: ReviewTarget) -> some View {
+        let sent = question.changeID.map { review.reviews.round(sending: $0, in: review.sessionID) != nil } ?? false
+        let waiting = question.changeID.map { review.reviews.comment($0, in: review.sessionID) != nil } ?? false
+        let (text, ink): (String, Color) = switch question.status {
+        case .answering: ("Answering…", Color.secondary)
+        case .failed: ("Couldn't answer", Theme.warningText)
+        case .answered:
+            sent ? ("Became a change", Theme.accent)
+                : waiting ? ("Change in review", Theme.accent)
+                : question.resolved ? ("Resolved", Color.secondary) : ("Answered", Theme.plan)
+        }
+        return Text(text)
+            .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(ink)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(ink.opacity(0.12)))
+            .lineLimit(1).fixedSize()
     }
 
     // MARK: Review list
@@ -2701,8 +3065,8 @@ struct ChangesView: View {
                                     Text("Nothing left to look at").font(.system(size: 12.5, weight: .semibold))
                                     Text("Every finding has been kept or dismissed. Send the review when you are ready.")
                                 } else {
-                                    Text("No comments yet").font(.system(size: 12.5, weight: .semibold))
-                                    Text("Click a line number in the diff to comment on it, or ask another agent for a second opinion.")
+                                    Text("No changes waiting").font(.system(size: 12.5, weight: .semibold))
+                                    Text("Click a line number and choose Request a change, turn a question's suggestion into a change, or ask another agent for a second opinion.")
                                 }
                             }
                             .font(.system(size: 11.5)).foregroundStyle(.secondary)

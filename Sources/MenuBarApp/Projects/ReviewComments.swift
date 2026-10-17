@@ -95,6 +95,10 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
     var edited = false
     // Its code left the diff and the person chose to keep it on the file as a whole.
     var onFile = false
+    // Made from a question's suggested change. The question stays on the Changes screen.
+    var questionID: UUID?
+    // The question and its answer, sent along only when the person ticks to include them.
+    var why: String?
 
     init(root: String, path: String, anchor: DiffAnchor, excerpt: String, body: String,
          author: Author = .you, excerptOffsets: [Int]? = nil, kind: Kind = .change,
@@ -134,6 +138,8 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
         also = try values.decodeIfPresent([Voice].self, forKey: .also) ?? []
         edited = try values.decodeIfPresent(Bool.self, forKey: .edited) ?? false
         onFile = try values.decodeIfPresent(Bool.self, forKey: .onFile) ?? false
+        questionID = try values.decodeIfPresent(UUID.self, forKey: .questionID)
+        why = try values.decodeIfPresent(String.self, forKey: .why)
     }
 
     var anchor: DiffAnchor { DiffAnchor(side: side, line: line, lastLine: lastLine) }
@@ -316,6 +322,7 @@ enum ReviewPrompt {
                 text += "\n```\n" + comment.excerpt + "\n```"
             }
             text += "\n" + comment.body.trimmed
+            if let why = comment.why, !why.isBlank { text += "\n\nWhy: " + why.trimmed }
         }
         if !note.isBlank { text += "\n\nOne more thing: " + note.trimmed }
         return text
@@ -691,6 +698,10 @@ final class ReviewCommentStore {
     // closed and reopened while one runs.
     private(set) var runs: [UUID: [SecondOpinionRun]] = [:]
     private var rounds: [UUID: [ReviewRound]] = [:]
+    // Questions answered on the Changes screen, which never go to the agent.
+    private var questions: [UUID: [ReviewQuestion]] = [:]
+    // What each side copy is doing while it answers, step by step. Kept only while it runs.
+    private(set) var questionSteps: [UUID: [String]] = [:]
     // What each file held when a review or a reply went, by round or reply id, so the
     // answer can show what the agent changed. Kept only while the app runs.
     @ObservationIgnored private var sentTexts: [UUID: [String: String]] = [:]
@@ -698,23 +709,43 @@ final class ReviewCommentStore {
     @ObservationIgnored private var tasks: [UUID: [AgentKind: Task<Void, Never>]] = [:]
     @ObservationIgnored private let url: URL?
     @ObservationIgnored private let roundsURL: URL?
+    @ObservationIgnored private let questionsURL: URL?
+    @ObservationIgnored private var questionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var saver: DebouncedSaver?
     // Reading files and asking git for trees is done off the main thread; tests swap in
     // their own so a round settles without touching the disk.
     @ObservationIgnored var readFile: @Sendable (String) -> String? = { path in
         try? String(contentsOfFile: path, encoding: .utf8)
     }
+    // How a question is answered; tests swap in their own so nothing is run.
+    @ObservationIgnored var answerQuestion: @Sendable (SideQuestion.Request, @escaping @Sendable (String) -> Void)
+        async -> Result<SideQuestion.Reply, SecondOpinion.Failure> = SideQuestion.answer
 
     init(url: URL? = AppPaths.supportFile("review-comments.json")) {
         self.url = url
         roundsURL = url.map {
             $0.deletingPathExtension().appendingPathExtension("rounds").appendingPathExtension("json")
         }
+        questionsURL = url.map {
+            $0.deletingPathExtension().appendingPathExtension("questions").appendingPathExtension("json")
+        }
         if let url, let stored = try? PersistentFile.loadJSON([UUID: [ReviewComment]].self, from: url) {
             comments = stored
         }
         if let roundsURL, let stored = try? PersistentFile.loadJSON([UUID: [ReviewRound]].self, from: roundsURL) {
             rounds = stored
+        }
+        if let questionsURL, let stored = try? PersistentFile.loadJSON([UUID: [ReviewQuestion]].self, from: questionsURL) {
+            // A side copy does not outlive the app, so one cut off by quitting says so.
+            questions = stored.mapValues { list in
+                list.map { question in
+                    var question = question
+                    if question.status == .answering, let last = question.exchanges.indices.last {
+                        question.exchanges[last].failure = "The app quit before it answered."
+                    }
+                    return question
+                }
+            }
         }
         saver = DebouncedSaver { [weak self] in self?.save() }
     }
@@ -804,6 +835,8 @@ final class ReviewCommentStore {
         runs[sessionID] = nil
         clear(sessionID)
         rounds[sessionID] = nil
+        for question in questions(sessionID) { stopQuestion(question.id) }
+        questions[sessionID] = nil
         saver?.schedule()
     }
 
@@ -1167,6 +1200,149 @@ final class ReviewCommentStore {
         saver?.schedule()
     }
 
+    // MARK: - Questions
+
+    func questions(_ sessionID: UUID) -> [ReviewQuestion] { questions[sessionID] ?? [] }
+
+    func questions(_ sessionID: UUID, root: String, path: String) -> [ReviewQuestion] {
+        questions(sessionID).filter { $0.root == root && $0.path == path }
+    }
+
+    func question(_ id: UUID, in sessionID: UUID) -> ReviewQuestion? {
+        questions[sessionID]?.first { $0.id == id }
+    }
+
+    func isAnswering(_ id: UUID) -> Bool { questionTasks[id] != nil }
+
+    // A question goes at once to a side copy of the session. Nothing about it reaches the
+    // main conversation.
+    func ask(_ question: ReviewQuestion, context: QuestionContext, in sessionID: UUID) {
+        questions[sessionID, default: []].append(question)
+        saver?.schedule()
+        startAnswer(question.id, context: context, in: sessionID)
+    }
+
+    func followUp(_ text: String, to id: UUID, context: QuestionContext, in sessionID: UUID) {
+        guard !text.isBlank, let index = questionIndex(id, in: sessionID),
+              questions[sessionID]?[index].status != .answering else { return }
+        questions[sessionID]?[index].exchanges.append(.init(question: text.trimmed))
+        questions[sessionID]?[index].resolved = false
+        saver?.schedule()
+        startAnswer(id, context: context, in: sessionID)
+    }
+
+    func retryQuestion(_ id: UUID, context: QuestionContext, in sessionID: UUID) {
+        guard let index = questionIndex(id, in: sessionID),
+              let last = questions[sessionID]?[index].exchanges.indices.last,
+              questions[sessionID]?[index].status == .failed else { return }
+        questions[sessionID]?[index].exchanges[last].failure = nil
+        saver?.schedule()
+        startAnswer(id, context: context, in: sessionID)
+    }
+
+    func deleteQuestion(_ id: UUID, in sessionID: UUID) {
+        stopQuestion(id)
+        questions[sessionID]?.removeAll { $0.id == id }
+        if questions[sessionID]?.isEmpty == true { questions[sessionID] = nil }
+        saver?.schedule()
+    }
+
+    func setResolved(_ id: UUID, _ resolved: Bool, in sessionID: UUID) {
+        guard let index = questionIndex(id, in: sessionID) else { return }
+        questions[sessionID]?[index].resolved = resolved
+        saver?.schedule()
+    }
+
+    // The answer's suggestion becomes a change in the review, on the question's lines. It
+    // goes to the agent only with the review, and on its own words unless the person ticks
+    // to send the question and answer along.
+    @discardableResult
+    func makeChange(from id: UUID, in sessionID: UUID) -> ReviewComment? {
+        guard let index = questionIndex(id, in: sessionID), let question = questions[sessionID]?[index],
+              !question.isWhole, let suggestion = question.suggestion else { return nil }
+        if let existing = question.changeID.flatMap({ comment($0, in: sessionID) }) { return existing }
+        var change = ReviewComment(root: question.root, path: question.path, anchor: question.anchor,
+                                   excerpt: question.excerpt, body: suggestion,
+                                   excerptOffsets: question.excerptOffsets)
+        change.questionID = id
+        add(change, to: sessionID)
+        questions[sessionID]?[index].changeID = change.id
+        return change
+    }
+
+    func takeOutOfReview(_ questionID: UUID, in sessionID: UUID) {
+        guard let index = questionIndex(questionID, in: sessionID),
+              let changeID = questions[sessionID]?[index].changeID else { return }
+        remove(changeID, from: sessionID)
+        questions[sessionID]?[index].changeID = nil
+        saver?.schedule()
+    }
+
+    func setSendsQuestion(_ on: Bool, change commentID: UUID, in sessionID: UUID) {
+        guard let index = comments[sessionID]?.firstIndex(where: { $0.id == commentID }),
+              let questionID = comments[sessionID]?[index].questionID else { return }
+        comments[sessionID]?[index].why = on ? question(questionID, in: sessionID)?.why : nil
+        saver?.schedule()
+    }
+
+    // The round a comment went in, once it has been sent.
+    func round(sending commentID: UUID, in sessionID: UUID) -> ReviewRound? {
+        rounds(sessionID).first { round in round.comments.contains { $0.id == commentID } }
+    }
+
+    private func questionIndex(_ id: UUID, in sessionID: UUID) -> Int? {
+        questions[sessionID]?.firstIndex { $0.id == id }
+    }
+
+    private func stopQuestion(_ id: UUID) {
+        questionTasks[id]?.cancel()
+        questionTasks[id] = nil
+        questionSteps[id] = nil
+    }
+
+    private func startAnswer(_ id: UUID, context: QuestionContext, in sessionID: UUID) {
+        guard let question = question(id, in: sessionID) else { return }
+        stopQuestion(id)
+        guard let executable = context.executable else {
+            finishAnswer(id, in: sessionID, outcome: .failure(.init(message: "\(context.agent.title) is not installed.")))
+            return
+        }
+        questionSteps[id] = []
+        let request = SideQuestion.Request(question: question, context: context, executable: executable,
+                                           searchPath: ProcessManager.searchPath)
+        let answer = answerQuestion
+        questionTasks[id] = Task { [weak self] in
+            let outcome = await answer(request) { step in
+                Task { @MainActor in self?.addStep(step, to: id) }
+            }
+            guard !Task.isCancelled else { return }
+            self?.finishAnswer(id, in: sessionID, outcome: outcome)
+        }
+    }
+
+    private func addStep(_ step: String, to id: UUID) {
+        guard questionTasks[id] != nil, questionSteps[id]?.last != step else { return }
+        questionSteps[id, default: []].append(step)
+    }
+
+    // Called by the run when it ends; tests call it directly with what a side copy said.
+    func finishAnswer(_ id: UUID, in sessionID: UUID, outcome: Result<SideQuestion.Reply, SecondOpinion.Failure>) {
+        questionTasks[id] = nil
+        questionSteps[id] = nil
+        guard let index = questionIndex(id, in: sessionID),
+              let last = questions[sessionID]?[index].exchanges.indices.last else { return }
+        switch outcome {
+        case .success(let reply):
+            questions[sessionID]?[index].exchanges[last].answer = reply.answer
+            questions[sessionID]?[index].exchanges[last].suggestion = reply.suggestion
+            questions[sessionID]?[index].exchanges[last].answered = Date()
+            if let fork = reply.forkID { questions[sessionID]?[index].forkID = fork }
+        case .failure(let failure):
+            questions[sessionID]?[index].exchanges[last].failure = failure.message
+        }
+        saver?.schedule()
+    }
+
     private func save() {
         do {
             if let url {
@@ -1176,6 +1352,10 @@ final class ReviewCommentStore {
             if let roundsURL {
                 if rounds.isEmpty { try PersistentFile.removeIfPresent(roundsURL) }
                 else { try PersistentFile.saveJSON(rounds, to: roundsURL) }
+            }
+            if let questionsURL {
+                if questions.isEmpty { try PersistentFile.removeIfPresent(questionsURL) }
+                else { try PersistentFile.saveJSON(questions, to: questionsURL) }
             }
         } catch {
             SessionLog.note("could not save review comments: \(error.localizedDescription)")

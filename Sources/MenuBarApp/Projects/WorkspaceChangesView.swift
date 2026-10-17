@@ -56,7 +56,14 @@ struct WorkspaceChangesView: View {
                             executable: { [runner] in runner.executable(for: $0) },
                             isBusy: { [runner] in runner.state(sessionID).isBusy },
                             send: { [runner, store] in runner.send($0, sessionID: sessionID, store: store) },
-                            openChat: reviewSent)
+                            openChat: reviewSent,
+                            conversation: { [store, session, initialRoot] in
+                                let current = store.session(sessionID) ?? session
+                                return ReviewConversation(
+                                    directory: store.workingDirectories(for: current).first ?? initialRoot,
+                                    claudeSessionID: current.agentSessionID(for: .claudeCode),
+                                    recentChat: SideQuestion.recentChat(current.messages))
+                            })
     }
 
     private func name(_ root: String) -> String {

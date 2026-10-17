@@ -223,6 +223,31 @@ enum SecondOpinion {
         guard let directory = repositories.first?.root else {
             return .failure(Failure(message: "There is no project to review."))
         }
+        let prompt = prompt(for: patches, repositories: repositories, focus: focus, sinceReview: sinceReview)
+        let output = await run(agent: agent, executable: executable, searchPath: searchPath, directory: directory,
+                               timeout: .seconds(420), writing: "Writing findings", activity: activity) { codexServers, copilotServers in
+            arguments(for: agent, prompt: prompt, addDirectories: repositories.dropFirst().map(\.root),
+                      codexServers: codexServers, copilotServers: copilotServers)
+        }
+        switch output {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let raw):
+            let answer = answer(from: raw, agent: agent)
+            guard let findings = findings(in: answer) else {
+                SessionLog.note("\(agent.command) second opinion was unreadable: " + String(answer.prefix(400)))
+                return .failure(Failure(message: "Its answer was not a list of findings."))
+            }
+            return .success(comments(from: findings, patches: patches, agent: agent))
+        }
+    }
+
+    // Runs an agent's CLI read-only and hands back everything it printed. Codex's own MCP
+    // servers are listed first so the arguments can turn each one off by name.
+    static func run(agent: AgentKind, executable: String, searchPath: String, directory: String,
+                    timeout: Duration, writing: String,
+                    activity: @escaping @Sendable (String) -> Void,
+                    arguments: (_ codexServers: [DisabledMCPServer], _ copilotServers: [String]) -> [String]) async -> Result<String, Failure> {
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = searchPath
         let output: CommandRunner.Output
@@ -245,36 +270,28 @@ enum SecondOpinion {
                 }
                 codexServers = servers
             }
-            let reader = ActivityReader(agent: agent, report: activity)
+            let reader = ActivityReader(agent: agent, writing: writing, report: activity)
             output = try await CommandRunner.run(
                 executable: executable,
-                arguments: arguments(for: agent, prompt: prompt(for: patches, repositories: repositories,
-                                                                focus: focus, sinceReview: sinceReview),
-                                     addDirectories: repositories.dropFirst().map(\.root),
-                                     codexServers: codexServers,
-                                     copilotServers: agent == .copilot ? copilotServers() : []),
+                arguments: arguments(codexServers, agent == .copilot ? copilotServers() : []),
                 currentDirectory: URL(fileURLWithPath: directory),
                 environment: environment,
                 outputChunkHandler: { reader.take($0) },
-                timeout: .seconds(420),
+                timeout: timeout,
                 outputByteLimit: 8_388_608)
         } catch let error as CommandRunner.RunError {
+            let minutes = Int(timeout.components.seconds / 60)
             return .failure(Failure(message: error == .timedOut
-                ? "It took longer than seven minutes." : error.localizedDescription))
+                ? "It took longer than \(counted(minutes, "minute"))." : error.localizedDescription))
         } catch {
             return .failure(Failure(message: error.localizedDescription))
         }
         guard output.succeeded else {
-            SessionLog.note("\(agent.command) second opinion failed status=\(output.status) "
+            SessionLog.note("\(agent.command) read-only run failed status=\(output.status) "
                             + String(output.errorOutput.suffix(400)))
             return .failure(Failure(message: "The \(agent.command) command stopped with status \(output.status)."))
         }
-        let answer = answer(from: output.output, agent: agent)
-        guard let findings = findings(in: answer) else {
-            SessionLog.note("\(agent.command) second opinion was unreadable: " + String(answer.prefix(400)))
-            return .failure(Failure(message: "Its answer was not a list of findings."))
-        }
-        return .success(comments(from: findings, patches: patches, agent: agent))
+        return .success(output.output)
     }
 
     // MARK: - What the reviewer is doing
@@ -309,13 +326,15 @@ enum SecondOpinion {
     // ever sees chunks, so it keeps the part of a line that has not ended yet.
     private final class ActivityReader: @unchecked Sendable {
         private let agent: AgentKind
+        private let writing: String
         private let report: @Sendable (String) -> Void
         private let copilot = CopilotStream()
         private let lock = NSLock()
         private var partial = Data()
 
-        init(agent: AgentKind, report: @escaping @Sendable (String) -> Void) {
+        init(agent: AgentKind, writing: String, report: @escaping @Sendable (String) -> Void) {
             self.agent = agent
+            self.writing = writing
             self.report = report
         }
 
@@ -337,7 +356,7 @@ enum SecondOpinion {
                 for event in events {
                     switch event {
                     case .toolUse(let tool): report(SecondOpinion.activity(for: tool))
-                    case .text: report("Writing findings")
+                    case .text: report(writing)
                     default: break
                     }
                 }

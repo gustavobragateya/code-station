@@ -222,7 +222,9 @@ struct ReviewCommentCard: View {
     }
 }
 
-// Where a comment is written, opened right under the lines it is about.
+// Where a comment is written, opened right under the lines it is about. A new one is
+// either a question, answered here by a side copy and never sent, or a change, which
+// waits in the review for the agent. The band, the hint and the button all say which.
 struct ReviewComposer: View {
     @Binding var text: String
     @Binding var kind: ReviewComment.Kind
@@ -232,41 +234,95 @@ struct ReviewComposer: View {
     let action: String
     // Shown only for a new comment, where shift-click still stretches the lines.
     var stretches = true
+    // The file and lines, for the band over a new comment.
+    var place = ""
+    // The side copy is a fork of the conversation, so it has read the chat itself.
+    var forksConversation = true
     var onDelete: (() -> Void)?
     let onSave: () -> Void
     let onCancel: () -> Void
 
     @FocusState private var focused: Bool
 
+    private var asks: Bool { stretches && kind == .question }
+
     var body: some View {
+        Group {
+            if stretches { newComment } else { editor }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
+        .onAppear { focused = true }
+    }
+
+    private var newComment: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            RouteBand(place: place, stays: asks, agentTitle: agentTitle)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 4) {
+                    ChoicePill(title: "Ask a question", selected: kind == .question) { kind = .question; focused = true }
+                        .accessibilityAddTraits(kind == .question ? .isSelected : [])
+                    ChoicePill(title: "Request a change", selected: kind == .change) { kind = .change; focused = true }
+                        .accessibilityAddTraits(kind == .change ? .isSelected : [])
+                    Spacer(minLength: 0)
+                    Text(linesLabel).scaledMono(10.5).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Kind of comment")
+                field(asks ? "What do you want to know about these lines?" : "What should \(agentTitle) change here?")
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: asks ? "eye.slash" : "paperplane")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(asks ? Theme.plan : Theme.accent)
+                        .padding(.top, 1)
+                    Text(asks ? questionHint : "Waits in your review with any others. \(agentTitle) gets them all in one message when you send.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    HStack(spacing: 4) {
+                        KeyCap(key: "⌘↩"); Text(asks ? "ask" : "add")
+                        Text("·"); KeyCap(key: "esc"); Text("cancel")
+                        Text("· shift-click a number to cover more lines").lineLimit(1)
+                    }
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+                    Spacer(minLength: 0)
+                    InlineLink(title: "Cancel", tint: Color.secondary, action: onCancel)
+                    ActionButton(title: asks ? "Ask" : "Add to review", tone: asks ? .plan : .green, height: 28, size: 12,
+                                 icon: asks ? "questionmark" : "pencil",
+                                 keyboardShortcut: KeyboardShortcut(.return, modifiers: .command), action: save)
+                        .disabled(text.isBlank)
+                }
+            }
+            .padding(12)
+        }
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke((asks ? Theme.plan : Theme.accent).opacity(0.55)))
+    }
+
+    private var questionHint: String {
+        forksConversation
+            ? "A side copy of this session answers here. It has read the chat, but it can't edit files and nothing it says is added to the chat."
+            : "A read-only run of \(agentTitle) answers here, given the diff and the recent chat. It can't edit files and nothing it says is added to the chat."
+    }
+
+    private var editor: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 ReviewAvatar(agent: nil)
                 Text(title).scaledText(12, .semibold).lineLimit(1)
                 Text(linesLabel).scaledMono(10.5).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 8)
-                HStack(spacing: 4) {
-                    ChoicePill(title: "Change this", selected: kind == .change) { kind = .change; focused = true }
-                    ChoicePill(title: "Ask a question", selected: kind == .question) { kind = .question; focused = true }
-                }
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Kind of comment")
             }
-            TextField(kind == .question
-                      ? "What should \(agentTitle) explain? It answers without changing the code."
-                      : "What should \(agentTitle) change here?",
-                      text: $text, axis: .vertical)
-                .lineLimit(2...8)
-                .appTextField()
-                .focused($focused)
-                .onSubmit(save)
-                .onExitCommand(perform: onCancel)
-                .accessibilityLabel("Comment")
+            field(kind == .question
+                  ? "What should \(agentTitle) explain? It answers without changing the code."
+                  : "What should \(agentTitle) change here?")
             HStack(spacing: 14) {
                 HStack(spacing: 4) {
-                    KeyCap(key: "↩"); Text(onDelete == nil && stretches ? "add" : "save")
+                    KeyCap(key: "↩"); Text("save")
                     Text("·"); KeyCap(key: "esc"); Text("cancel")
-                    if stretches { Text("· shift-click a number to cover more lines").lineLimit(1) }
                 }
                 .font(.system(size: 11)).foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
@@ -283,14 +339,351 @@ struct ReviewComposer: View {
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.accent.opacity(0.55)))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(title)
-        .onAppear { focused = true }
+    }
+
+    private func field(_ prompt: String) -> some View {
+        TextField(prompt, text: $text, axis: .vertical)
+            .lineLimit(2...8)
+            .appTextField()
+            .focused($focused)
+            .onSubmit(save)
+            .onExitCommand(perform: onCancel)
+            .accessibilityLabel(asks ? "Question" : "Comment")
     }
 
     private func save() {
         guard !text.isBlank else { return }
         onSave()
+    }
+}
+
+// The strip over a comment that says where it goes: blue for a question that stays on
+// this screen, green for a change that goes to the agent. Always in words as well.
+struct RouteBand: View {
+    let place: String
+    let stays: Bool
+    let agentTitle: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(place).font(.mono(11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 8)
+            Label(stays ? "Only in Changes" : "Goes to \(agentTitle)", systemImage: stays ? "eye.slash" : "paperplane")
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(stays ? Theme.plan : Theme.accent)
+                .lineLimit(1).fixedSize()
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background((stays ? Theme.plan : Theme.accent).opacity(0.07))
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// A side copy of the session: the agent's mark in a dashed ring, so it reads as the same
+// agent but not the same conversation. The ring turns while it answers.
+struct SideCopyAvatar: View {
+    let agent: AgentKind
+    var size: CGFloat = 22
+    var answering = false
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: !answering || reduceMotion)) { context in
+            let phase = answering && !reduceMotion
+                ? CGFloat(context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2) * -9 : 0
+            ReviewAvatar(agent: agent, size: size - 6)
+                .frame(width: size, height: size)
+                .overlay {
+                    Circle().strokeBorder(Theme.plan.opacity(0.75),
+                                          style: StrokeStyle(lineWidth: 1.2, dash: [2.5, 2], dashPhase: phase))
+                        .padding(-2)
+                }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+// A question as a thread under its lines: what was asked, the side copy's answer as it
+// comes in, any follow-ups, and what can be done with a change it suggests. Nothing in it
+// reaches the main chat unless the person turns the suggestion into a change and sends it.
+struct QuestionThreadView: View {
+    let question: ReviewQuestion
+    let place: String
+    var steps: [String] = []
+    var showsBand = true
+    var focused = false
+    var projectPath = ""
+    var textScale: CGFloat = 1
+    // The change made from the suggestion, waiting in the review or already sent, and
+    // when it went.
+    var change: ReviewComment?
+    var changeSent: Date?
+    let followUp: (String) -> Void
+    let resolve: () -> Void
+    let reopen: () -> Void
+    let retry: () -> Void
+    let delete: () -> Void
+    // Nil where there are no lines to hang a change from: a question on the whole change.
+    var makeChange: (() -> Void)?
+    var takeOut: () -> Void = {}
+    var editChange: (String) -> Void = { _ in }
+    var sendsQuestion: (Bool) -> Void = { _ in }
+
+    @State private var asking = false
+    @State private var draft = ""
+    @FocusState private var fieldFocused: Bool
+
+    private var agent: AgentKind { question.agent }
+
+    var body: some View {
+        Group {
+            if question.resolved && question.status == .answered { collapsed } else { full }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(question.spokenName)
+    }
+
+    private var collapsed: some View {
+        Button(action: reopen) {
+            HStack(spacing: 8) {
+                Image(systemName: "questionmark.circle").foregroundStyle(Theme.plan)
+                (Text(question.text).fontWeight(.medium)
+                 + Text(ReviewText.attributed(" - " + (question.exchanges.last?.answer ?? ""))).foregroundStyle(.secondary))
+                    .font(.system(size: 12)).lineLimit(1)
+                Spacer(minLength: 8)
+                ReviewStatusChip(status: .answered)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens the question again")
+    }
+
+    private var full: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showsBand { RouteBand(place: place, stays: true, agentTitle: agent.title) }
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(question.exchanges) { exchange in
+                    you(exchange.question, first: exchange.id == question.exchanges.first?.id)
+                    if let answer = exchange.answer {
+                        sideCopy(meta: meta(exchange)) {
+                            MarkdownProse(text: answer, projectPath: projectPath, textScale: textScale) { segment in
+                                MarkdownCodeBlock(segment: segment).equatable()
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else if let failure = exchange.failure {
+                        failed(failure)
+                    } else {
+                        answering
+                    }
+                }
+                if question.status == .answered { outcome }
+            }
+            .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 14)
+            if asking { followUpBox }
+            if question.status == .answered, !asking { actions }
+        }
+    }
+
+    private func meta(_ exchange: ReviewQuestion.Exchange) -> String {
+        let time = (exchange.answered ?? exchange.asked).formatted(date: .omitted, time: .shortened)
+        return "side copy · \(time) · changed nothing"
+    }
+
+    private func you(_ text: String, first: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            ReviewAvatar(agent: nil, size: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 7) {
+                    Text("You").font(.system(size: 12, weight: .semibold))
+                    if first { QuestionTag() }
+                }
+                .frame(minHeight: 22)
+                ReviewText(text: text, size: 13)
+            }
+        }
+    }
+
+    private func sideCopy<Content: View>(meta: String, answering: Bool = false,
+                                         @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            SideCopyAvatar(agent: agent, answering: answering)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 7) {
+                    Text(agent.title).font(.system(size: 12, weight: .semibold))
+                    Text(meta).font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+                .frame(minHeight: 22)
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var answering: some View {
+        sideCopy(meta: "side copy · answering", answering: true) {
+            VStack(alignment: .leading, spacing: 4) {
+                let shown = steps.isEmpty ? ["Starting"] : steps
+                ForEach(Array(shown.enumerated()), id: \.offset) { index, step in
+                    HStack(spacing: 6) {
+                        if index == shown.count - 1 {
+                            ProgressView().controlSize(.mini).frame(width: 12)
+                        } else {
+                            Image(systemName: "checkmark").font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(Theme.dotOn).frame(width: 12)
+                        }
+                        Text(step).lineLimit(1).truncationMode(.middle)
+                    }
+                }
+            }
+            .font(.system(size: 12)).foregroundStyle(.secondary)
+            .padding(.top, 2)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(agent.title) is answering. " + (steps.last ?? ""))
+        }
+    }
+
+    private func failed(_ reason: String) -> some View {
+        sideCopy(meta: "side copy") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    (Text("Couldn't answer. ").fontWeight(.semibold) + Text(reason))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.system(size: 12)).foregroundStyle(Theme.warningText)
+                HStack(spacing: 12) {
+                    ActionButton(title: "Try again", tone: .outlined, height: 26, size: 11.5,
+                                 icon: "arrow.clockwise", action: retry)
+                    InlineLink(title: "Delete", size: 11.5, tint: Theme.deletion, action: delete)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.warningBackground))
+        }
+    }
+
+    // What the answer leads to: a change to make, one already in the review or sent, or
+    // nothing at all.
+    @ViewBuilder private var outcome: some View {
+        if let suggestion = question.suggestion {
+            Group {
+                if let change, let changeSent {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Sent to \(agent.title) at " + changeSent.formatted(date: .omitted, time: .shortened),
+                              systemImage: "checkmark")
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(Theme.accent)
+                        ReviewText(text: change.body, size: 12.5).foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.field))
+                } else if let change {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Change for \(agent.title) · in your review", systemImage: "pencil")
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(Theme.accent)
+                        TextField("What should \(agent.title) change?",
+                                  text: Binding(get: { change.body }, set: editChange), axis: .vertical)
+                            .lineLimit(1...6)
+                            .appTextField()
+                            .accessibilityLabel("Change for \(agent.title)")
+                        HStack(spacing: 12) {
+                            Toggle("Also send the question and answer",
+                                   isOn: Binding(get: { change.why != nil }, set: sendsQuestion))
+                                .toggleStyle(.appCheckbox)
+                                .font(.system(size: 11.5))
+                            Spacer(minLength: 0)
+                            InlineLink(title: "Take out of review", size: 11.5, tint: Color.secondary, action: takeOut)
+                        }
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent.opacity(0.06)))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.accent.opacity(0.35)))
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Suggests a change", systemImage: "pencil")
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(.secondary)
+                        ReviewText(text: suggestion, size: 12.5)
+                        if let makeChange {
+                            HStack(spacing: 10) {
+                                ActionButton(title: "Make this a change", tone: .green, height: 26, size: 11.5,
+                                             icon: "pencil", action: makeChange)
+                                Text("Goes to \(agent.title) only when you send your review")
+                                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.field))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.border, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                }
+            }
+            .padding(.leading, 32)
+        } else {
+            Label("No change suggested. Nothing here will reach the chat.", systemImage: "checkmark")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                .padding(.leading, 32)
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 8) {
+            ActionButton(title: "Ask a follow-up", tone: .outlined, height: 26, size: 11.5) {
+                asking = true
+                fieldFocused = true
+            }
+            Spacer(minLength: 0)
+            InlineLink(title: "Resolve", size: 11.5, tint: Color.secondary, action: resolve)
+        }
+        .padding(.leading, 48).padding(.trailing, 16).padding(.bottom, 14)
+    }
+
+    private var followUpBox: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Ask \(agent.title) a follow-up. The answer stays here.", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .lineLimit(2...8)
+                .focused($fieldFocused)
+                .onSubmit(send)
+                .onExitCommand(perform: cancel)
+                .accessibilityLabel("Follow-up question")
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    KeyCap(key: "⌘↩"); Text("ask")
+                    KeyCap(key: "esc"); Text("cancel")
+                }
+                .font(.system(size: 11)).foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+                Spacer(minLength: 0)
+                InlineLink(title: "Cancel", size: 11.5, tint: Color.secondary, action: cancel)
+                ActionButton(title: "Ask", tone: .plan, height: 26, size: 11.5, icon: "questionmark",
+                             keyboardShortcut: KeyboardShortcut(.return, modifiers: .command), action: send)
+                    .disabled(draft.isBlank)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.plan.opacity(0.5)))
+        .padding(.leading, 48).padding(.trailing, 16).padding(.bottom, 14)
+        .onAppear { fieldFocused = true }
+    }
+
+    private func send() {
+        guard !draft.isBlank else { return }
+        followUp(draft.trimmed)
+        draft = ""
+        asking = false
+    }
+
+    private func cancel() {
+        draft = ""
+        asking = false
     }
 }
 
@@ -504,6 +897,8 @@ struct SendReviewSheet: View {
     let comments: [ReviewComment]
     let pendingCount: Int
     let busy: Bool
+    // Questions asked on the Changes screen whose answers do not go with this message.
+    var questionsLeftOut = 0
     let fileName: (ReviewComment) -> String
     let prompt: ([ReviewComment], String) -> String
     let lookFirst: () -> Void
@@ -517,6 +912,7 @@ struct SendReviewSheet: View {
     @State private var listHeight: CGFloat = 120
 
     init(agentTitle: String, comments: [ReviewComment], pendingCount: Int, busy: Bool,
+         questionsLeftOut: Int = 0, startsOnMessage: Bool = false,
          fileName: @escaping (ReviewComment) -> String,
          prompt: @escaping ([ReviewComment], String) -> String,
          lookFirst: @escaping () -> Void, send: @escaping ([ReviewComment], String) -> Void) {
@@ -524,11 +920,13 @@ struct SendReviewSheet: View {
         self.comments = comments
         self.pendingCount = pendingCount
         self.busy = busy
+        self.questionsLeftOut = questionsLeftOut
         self.fileName = fileName
         self.prompt = prompt
         self.lookFirst = lookFirst
         self.send = send
         _picked = State(initialValue: Set(comments.map(\.id)))
+        _showsPrompt = State(initialValue: startsOnMessage)
     }
 
     private var chosen: [ReviewComment] { comments.filter { picked.contains($0.id) } }
@@ -604,6 +1002,12 @@ struct SendReviewSheet: View {
             .frame(height: min(300, listHeight))
             .background(Theme.field, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
+            if questionsLeftOut > 0 {
+                Label(questionsLeftOut == 1 ? "Your question and its answer are left out. They stay in Changes."
+                      : "Your \(questionsLeftOut) questions and their answers are left out. They stay in Changes.",
+                      systemImage: "eye.slash")
+                    .font(.system(size: 11.5)).foregroundStyle(Theme.plan)
+            }
             VStack(alignment: .leading, spacing: 6) {
                 Text("Anything else for this round?").font(.system(size: 12, weight: .semibold))
                 TextField("For example: run the tests when you are done", text: $note, axis: .vertical)

@@ -1075,6 +1075,8 @@ enum ButtonTone {
     case dark
     // The same weight, in the app's green, for starting work.
     case green
+    // The same weight in the read-only blue, for asking something that changes nothing.
+    case plan
     // The same weight in the deletion red, for the action a section exists to warn about.
     // It wears the same colour as the destructive button in a dialog, so the click that
     // opens the dialog and the click that confirms it read as the same action.
@@ -1171,6 +1173,9 @@ struct ActionButton: View {
     private var label: Color {
         switch tone {
         case .dark, .green, .danger, .attention: Color.white
+        // The card colour keeps the words clear on the blue in both appearances, since the
+        // blue itself lightens in dark mode.
+        case .plan: Theme.card
         case .attentionOutlined: Theme.attentionText
         case .outlined, .sunken: Color.primary
         }
@@ -1180,6 +1185,7 @@ struct ActionButton: View {
         switch tone {
         case .dark: Color.black.opacity(lit ? 0.82 : 0.9)
         case .green: lit ? Theme.accentFill.opacity(0.86) : Theme.accentFill
+        case .plan: lit ? Theme.plan.opacity(0.86) : Theme.plan
         case .danger: lit ? Theme.deletion.opacity(0.86) : Theme.deletion
         case .attention: lit ? Theme.secret.opacity(0.86) : Theme.secret
         case .attentionOutlined:
@@ -1191,7 +1197,7 @@ struct ActionButton: View {
 
     private var stroke: Color {
         switch tone {
-        case .dark, .green, .danger, .attention: .clear
+        case .dark, .green, .plan, .danger, .attention: .clear
         case .attentionOutlined: Theme.attention.opacity(0.38)
         case .outlined, .sunken: Theme.border
         }
