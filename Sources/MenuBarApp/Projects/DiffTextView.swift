@@ -26,6 +26,13 @@ struct DiffTextView: NSViewRepresentable {
     // Grow to the height of the whole diff instead of scrolling it, for a diff that sits
     // in a page with others and scrolls along with that page.
     var fitsContent = false
+    // A press on a line number, named by DiffAnchor key, and whether shift was held to
+    // stretch the comment being written over to it. Nil where the diff takes no comments.
+    var onLine: ((String, Bool) -> Void)?
+    // A press on a review comment drawn in the diff, named by its id.
+    var onComment: ((String) -> Void)?
+    // The lines the comment being written is about, drawn picked out.
+    var picked: Set<String> = []
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -72,6 +79,12 @@ struct DiffTextView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? DiffDocumentView else { return }
         textView.onExpand = onExpand
+        textView.onLine = onLine
+        textView.onComment = onComment
+        if textView.picked != picked {
+            textView.picked = picked
+            textView.needsDisplay = true
+        }
         // The string is built once per loaded diff, so identity is enough to tell the
         // same document from a newly opened file.
         guard context.coordinator.shown !== text else { return }
@@ -80,6 +93,9 @@ struct DiffTextView: NSViewRepresentable {
         let origin = scrollView.contentView.bounds.origin
         textView.textStorage?.setAttributedString(text)
         textView.sizeToFit()
+        // The text system only repaints where glyphs changed, but a row's band starts in
+        // the margin left of them, so rows that moved would keep stale margins.
+        textView.needsDisplay = true
         switch scroll {
         case .top:
             scrollView.contentView.scroll(to: .zero)
@@ -122,9 +138,14 @@ private final class DiffScrollView: NSScrollView {
 // attribute and is painted here across the whole line fragment.
 private final class DiffDocumentView: NSTextView {
     var onExpand: ((String, DiffExpandDirection) -> Void)?
+    var onLine: ((String, Bool) -> Void)?
+    var onComment: ((String) -> Void)?
+    var picked: Set<String> = []
     // The gap row under the pointer, which is drawn a shade stronger so it reads as
     // something to press.
     private var hovered: String?
+    // The line number or comment under the pointer, in a diff that takes comments.
+    private var hoveredRow: DiffRowHit?
     private var hoverTracking: NSTrackingArea?
 
     // Grow with the text, but never sit narrower than the pane, so the bands reach the
@@ -162,11 +183,21 @@ private final class DiffDocumentView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        // A held modifier means the click is about the selection, not the row.
-        let plain = event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+        // A held modifier means the click is about the selection, not the row. Shift is
+        // the one exception on a line number, where it stretches a comment over lines.
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let plain = flags.isEmpty
         if plain, let onExpand, let target = target(at: event), let direction = target.direction {
             onExpand(target.key, direction)
             return
+        }
+        if plain || flags == .shift, let row = row(at: event) {
+            switch row.kind {
+            case .line:
+                if let onLine { onLine(row.key, flags == .shift); return }
+            case .comment:
+                if plain, let onComment { onComment(row.key); return }
+            }
         }
         super.mouseDown(with: event)
     }
@@ -174,25 +205,38 @@ private final class DiffDocumentView: NSTextView {
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
         let target = target(at: event)
-        if target?.direction != nil { NSCursor.pointingHand.set() }
-        guard target?.key != hovered else { return }
+        let row = row(at: event)
+        if target?.direction != nil || row != nil { NSCursor.pointingHand.set() }
+        guard target?.key != hovered || row != hoveredRow else { return }
         hovered = target?.key
+        hoveredRow = row
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        guard hovered != nil else { return }
+        guard hovered != nil || hoveredRow != nil else { return }
         hovered = nil
+        hoveredRow = nil
         needsDisplay = true
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        if target(at: event)?.direction != nil {
+        if target(at: event)?.direction != nil || row(at: event) != nil {
             NSCursor.pointingHand.set()
         } else {
             super.cursorUpdate(with: event)
         }
+    }
+
+    private func row(at event: NSEvent) -> DiffRowHit? {
+        guard onLine != nil || onComment != nil,
+              let layoutManager, let textContainer, let storage = textStorage else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        let origin = textContainerOrigin
+        return DiffRowHit.at(NSPoint(x: point.x - origin.x, y: point.y - origin.y),
+                             layoutManager: layoutManager, container: textContainer,
+                             storage: storage)
     }
 
     private func target(at event: NSEvent) -> DiffGapHit? {
@@ -228,10 +272,84 @@ private final class DiffDocumentView: NSTextView {
                                                effectiveRange: nil) as? NSColor else { return }
             let isHovered = self.hovered != nil
                 && storage.attribute(.diffGap, at: index, effectiveRange: nil) as? String == self.hovered
-            (isHovered ? self.hoverFill(band) : band).setFill()
+            let comment = storage.attribute(.diffComment, at: index, effectiveRange: nil) as? String
+            let commentHovered = comment != nil && self.hoveredRow == DiffRowHit(kind: .comment, key: comment!)
+            (isHovered || commentHovered ? self.hoverFill(band) : band).setFill()
             NSRect(x: 0, y: fragment.minY + origin.y,
                    width: self.bounds.width, height: fragment.height).fill()
+            if comment != nil {
+                // The rule down the left edge ties a comment's rows into one card.
+                Theme.accentNSColor.setFill()
+                NSRect(x: 0, y: fragment.minY + origin.y, width: 3, height: fragment.height).fill()
+            }
         }
+        drawLineMarks(in: rect, layoutManager: layoutManager, container: textContainer, storage: storage)
+    }
+
+    // The lines a comment is being written about wear the accent across the row, and the
+    // number under the pointer turns into a plus so it reads as the place to start one.
+    private func drawLineMarks(in rect: NSRect, layoutManager: NSLayoutManager,
+                               container: NSTextContainer, storage: NSTextStorage) {
+        guard onLine != nil, !picked.isEmpty || hoveredRow?.kind == .line else { return }
+        let origin = textContainerOrigin
+        let glyphs = layoutManager.glyphRange(forBoundingRect: rect.offsetBy(dx: -origin.x, dy: -origin.y),
+                                              in: container)
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { fragment, _, _, lineGlyphs, _ in
+            let index = layoutManager.characterIndexForGlyph(at: lineGlyphs.location)
+            var numberRange = NSRange()
+            guard index < storage.length,
+                  let key = storage.attribute(.diffLineAnchor, at: index,
+                                              effectiveRange: &numberRange) as? String else { return }
+            if self.picked.contains(key) {
+                Theme.accentNSColor.withAlphaComponent(0.16).setFill()
+                NSRect(x: 0, y: fragment.minY + origin.y,
+                       width: self.bounds.width, height: fragment.height).fill()
+            }
+            guard self.hoveredRow == DiffRowHit(kind: .line, key: key) else { return }
+            let numbers = layoutManager.boundingRect(
+                forGlyphRange: layoutManager.glyphRange(forCharacterRange: numberRange, actualCharacterRange: nil),
+                in: container).offsetBy(dx: origin.x, dy: origin.y)
+            let badge = NSRect(x: numbers.minX, y: fragment.minY + origin.y + 1,
+                               width: numbers.width - 6, height: fragment.height - 2)
+            Theme.accentNSColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 4, yRadius: 4).fill()
+            let font = storage.attribute(.font, at: index, effectiveRange: nil) as? NSFont
+                ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+            let plus = NSAttributedString(string: "+", attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold),
+                .foregroundColor: Theme.accentNSColor
+            ])
+            let size = plus.size()
+            plus.draw(at: NSPoint(x: badge.minX + 5, y: badge.midY - size.height / 2))
+        }
+    }
+}
+
+// What a point in a diff that takes comments lands on: a line number to start a comment
+// from, or a comment already there to open. The number only answers over its own
+// characters, but a comment answers anywhere along its rows.
+struct DiffRowHit: Equatable {
+    enum Kind: Equatable { case line, comment }
+
+    var kind: Kind
+    var key: String
+
+    // The point is in text container coordinates.
+    static func at(_ point: NSPoint, layoutManager: NSLayoutManager,
+                   container: NSTextContainer, storage: NSTextStorage) -> DiffRowHit? {
+        guard storage.length > 0, point.x >= 0, point.y >= 0 else { return nil }
+        let index = layoutManager.characterIndex(for: point, in: container,
+                                                 fractionOfDistanceBetweenInsertionPoints: nil)
+        guard index < storage.length else { return nil }
+        let glyph = layoutManager.glyphIndexForCharacter(at: index)
+        let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        guard point.y >= fragment.minY, point.y < fragment.maxY else { return nil }
+        if let comment = storage.attribute(.diffComment, at: index, effectiveRange: nil) as? String {
+            return DiffRowHit(kind: .comment, key: comment)
+        }
+        guard let key = storage.attribute(.diffLineAnchor, at: index, effectiveRange: nil) as? String
+        else { return nil }
+        return DiffRowHit(kind: .line, key: key)
     }
 }
 
@@ -269,9 +387,11 @@ enum DiffText {
     // Lining up and colouring a long diff takes long enough to stall the window, so it is
     // built away from the main thread.
     static func build(_ lines: [DiffLine], language: CodeLanguage? = nil,
-                      scale: CGFloat = 1, numbered: Bool = false) async -> NSAttributedString {
+                      scale: CGFloat = 1, numbered: Bool = false,
+                      comments: DiffComments? = nil) async -> NSAttributedString {
         await Task.detached(priority: .userInitiated) {
-            Finished(text: attributed(lines, language: language, scale: scale, numbered: numbered))
+            Finished(text: attributed(lines, language: language, scale: scale, numbered: numbered,
+                                      comments: comments))
         }.value.text
     }
 
@@ -283,7 +403,8 @@ enum DiffText {
 
     static func attributed(_ lines: [DiffLine],
                            language: CodeLanguage? = nil,
-                           scale: CGFloat = 1, numbered: Bool = false) -> NSAttributedString {
+                           scale: CGFloat = 1, numbered: Bool = false,
+                           comments: DiffComments? = nil) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: 11 * scale, weight: .regular)
         // Colouring is for a diff a person reads; a huge one is scrolled, not read, and
         // plain text is much cheaper to build.
@@ -334,6 +455,13 @@ enum DiffText {
                     + String(repeating: " ", count: max(0, 5 - new.count)) + new + "  "
                 var numberAttributes = attributes
                 numberAttributes[.foregroundColor] = NSColor.secondaryLabelColor
+                // In a diff that takes comments the numbers are where one starts.
+                if comments != nil {
+                    let anchor = line.kind == .deletion
+                        ? pair?.0.map { DiffAnchor(side: .old, line: $0) }
+                        : pair?.1.map { DiffAnchor(side: .new, line: $0) }
+                    if let anchor { numberAttributes[.diffLineAnchor] = DiffComments.key(anchor) }
+                }
                 result.append(NSAttributedString(string: prefix, attributes: numberAttributes))
             }
             if let gap = line.gap {
@@ -343,11 +471,72 @@ enum DiffText {
             } else {
                 result.append(NSAttributedString(string: line.text, attributes: attributes))
             }
+            for comment in comments?.below[line.id] ?? [] {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+                result.append(commentRows(comment, indent: numbered ? 14 : 1, scale: scale))
+            }
             if index < lines.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: attributes))
             }
         }
         return result
+    }
+
+    // A review comment drawn as rows of its own under the line it is about: who left it,
+    // then the note, wrapped by hand since the diff never wraps its lines.
+    private static func commentRows(_ comment: DiffComments.Comment, indent: Int,
+                                    scale: CGFloat) -> NSAttributedString {
+        let mono = NSFont.monospacedSystemFont(ofSize: 11 * scale, weight: .regular)
+        var base: [NSAttributedString.Key: Any] = [
+            .font: mono,
+            .foregroundColor: NSColor.labelColor,
+            // A neutral card rather than an accent tint: the accent is the same green as an
+            // added line, and a comment among added lines would vanish into them.
+            .diffRowBackground: NSColor(Theme.card),
+            .diffComment: comment.id
+        ]
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = 2 * scale
+        base[.paragraphStyle] = style
+        let lead = String(repeating: " ", count: indent)
+        let result = NSMutableAttributedString()
+        func run(_ text: String, font: NSFont? = nil, colour: NSColor? = nil) {
+            var attributes = base
+            if let font { attributes[.font] = font }
+            if let colour { attributes[.foregroundColor] = colour }
+            result.append(NSAttributedString(string: text, attributes: attributes))
+        }
+        run(lead)
+        run(comment.author, font: NSFont.systemFont(ofSize: 11 * scale, weight: .semibold),
+            colour: Theme.accentNSColor)
+        run("  ·  click to edit", font: NSFont.systemFont(ofSize: 10.5 * scale),
+            colour: .tertiaryLabelColor)
+        for line in wrapped(comment.body, width: 96) {
+            run("\n" + lead)
+            run(line, font: NSFont.systemFont(ofSize: 12 * scale))
+        }
+        return result
+    }
+
+    // Breaks a note into lines of at most `width` characters, on spaces where it can.
+    static func wrapped(_ text: String, width: Int) -> [String] {
+        var lines: [String] = []
+        for paragraph in text.trimmed.components(separatedBy: "\n") {
+            var line = ""
+            for word in paragraph.split(separator: " ", omittingEmptySubsequences: false) {
+                var word = String(word)
+                while word.count > width {
+                    if !line.isEmpty { lines.append(line); line = "" }
+                    lines.append(String(word.prefix(width)))
+                    word = String(word.dropFirst(width))
+                }
+                if line.isEmpty { line = word }
+                else if line.count + 1 + word.count <= width { line += " " + word }
+                else { lines.append(line); line = word }
+            }
+            lines.append(line)
+        }
+        return lines
     }
 
     // What a gap row offers. A gap too long to open in one go opens from either end, so
@@ -444,4 +633,46 @@ extension NSAttributedString.Key {
     // Marks one control on such a row, holding the DiffExpandDirection it opens. Only
     // characters carrying it answer a press.
     static let diffGapAction = NSAttributedString.Key("codeStationDiffGapAction")
+
+    // Marks a line's numbers in a diff that takes comments, holding DiffComments.key of
+    // the line they number.
+    static let diffLineAnchor = NSAttributedString.Key("codeStationDiffLineAnchor")
+
+    // Marks the rows of a review comment, holding the comment's id.
+    static let diffComment = NSAttributedString.Key("codeStationDiffComment")
+}
+
+// The review comments a diff draws, already placed on the lines they belong under. It is
+// handed to the builder off the main thread, so it carries plain values rather than the
+// comments themselves.
+struct DiffComments: Sendable, Equatable {
+    struct Comment: Sendable, Equatable {
+        var id: String
+        var author: String
+        var body: String
+    }
+
+    var below: [Int: [Comment]] = [:]
+
+    init(_ placement: ReviewPlacement) {
+        below = placement.below.mapValues { comments in
+            comments.map { Comment(id: $0.id.uuidString, author: $0.authorName, body: $0.body) }
+        }
+    }
+
+    static func key(_ anchor: DiffAnchor) -> String { "\(anchor.side.rawValue):\(anchor.line)" }
+
+    static func anchor(_ key: String) -> DiffAnchor? {
+        let parts = key.split(separator: ":")
+        guard parts.count == 2, let side = ReviewSide(rawValue: String(parts[0])),
+              let line = Int(parts[1]) else { return nil }
+        return DiffAnchor(side: side, line: line)
+    }
+
+    // Every line a run covers, for drawing the run picked out.
+    static func keys(_ anchor: DiffAnchor) -> Set<String> {
+        Set((anchor.line...(anchor.lastLine ?? anchor.line)).map {
+            key(DiffAnchor(side: anchor.side, line: $0))
+        })
+    }
 }

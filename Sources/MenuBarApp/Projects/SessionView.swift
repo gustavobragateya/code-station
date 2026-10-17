@@ -326,7 +326,8 @@ struct SessionView: View {
                                                  initialPath: requestedChange?.path,
                                                  selectedRoot: Binding(get: { projectDirectory }, set: { root in
                                                      selectWorkspaceRoot(root, in: session)
-                                                 }), navigation: changesNavigation)
+                                                 }), navigation: changesNavigation,
+                                                 reviewSent: { tab = .conversation })
                             if let reviewingEnding,
                                reviewingEnding == runner.lastTurnEnding(sessionID)?.ended,
                                !runner.state(sessionID).isBusy {
