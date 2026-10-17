@@ -66,6 +66,9 @@ struct MobileShareSummary: Identifiable {
     let scope: MobileScope
     let name: String
     let isConnected: Bool
+    // The session the phone on this code is reading. Nil while it is on a list, and while
+    // no phone is connected.
+    var openSession: UUID?
 
     var reach: String {
         switch scope {
@@ -279,9 +282,10 @@ final class MobileAccessController {
     var activeShares: [MobileShareSummary] {
         pairings.values.map(\.share)
             .sorted { $0.createdAt > $1.createdAt }
-            .map {
-                MobileShareSummary(id: $0.id, scope: $0.scope,
-                                   name: title(for: $0.scope), isConnected: isLive($0.scope))
+            .map { share in
+                MobileShareSummary(id: share.id, scope: share.scope,
+                                   name: title(for: share.scope), isConnected: isLive(share.scope),
+                                   openSession: readers.values.first { $0.pairingID == share.id }?.openSession)
             }
     }
 
