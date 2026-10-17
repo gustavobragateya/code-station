@@ -1,8 +1,7 @@
 import SwiftUI
 
 // A session worth naming above the tree, and the few words that say why. The same list
-// feeds the NEEDS YOU card and the running count's menu, so the sidebar works it out once
-// for the pair rather than building and sorting it twice on every redraw.
+// feeds the NEEDS YOU card and the running count.
 struct NoticedSession {
     let session: ChatSession
     let project: Project
@@ -53,47 +52,6 @@ enum SidebarNotices {
             return "finished while away"
         }
     }
-
-    // The menu behind the running count. The list is already grouped by kind, so a rule
-    // between two neighbours of different kinds is all the separation it needs.
-    static func menu(_ notices: [NoticedSession], store: ProjectStore,
-                     isSelected: (ChatSession) -> Bool,
-                     open: @escaping (ChatSession) -> Void) -> [MenuEntry] {
-        var entries: [MenuEntry] = []
-        for (index, noticed) in notices.enumerated() {
-            if index > 0, notices[index - 1].notice != noticed.notice {
-                entries.append(.separator)
-            }
-            entries.append(.item(
-                noticed.session.title,
-                checked: isSelected(noticed.session),
-                badge: noticed.notice.badge,
-                badgeTint: noticed.notice.tint,
-                subtitle: noticed.session.workspaceID.flatMap(store.workspace)?.name
-                    ?? noticed.project.name,
-                detail: RelativeTime.short(noticed.session.lastActivity)) {
-                    open(noticed.session)
-                })
-        }
-        return entries
-    }
-}
-
-extension SessionNotice {
-    var badge: String {
-        switch self {
-        case .needsInput: "INPUT"
-        case .running: "RUNNING"
-        case .finished: "FINISHED"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .running: Theme.addition
-        case .needsInput, .finished: Theme.attention
-        }
-    }
 }
 
 // MARK: - The rail's header
@@ -105,97 +63,82 @@ struct SidebarBrandBar: View {
     let runningCount: Int
     let isHome: Bool
     let selectHome: () -> Void
-    let noticeMenu: () -> [MenuEntry]
 
     @Environment(\.textScale) private var textScale
+    @Environment(MobileAccessController.self) private var mobileAccess
     @State private var hovering = false
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                homeButton
-                Spacer(minLength: 0)
-                statusButtons
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                homeButton
-                HStack {
-                    Spacer(minLength: 0)
-                    statusButtons
-                }
+        HStack(spacing: 0) {
+            homeButton
+            if !mobileAccess.activeShares.isEmpty {
+                MobileAccessBadge()
+                    .fixedSize()
+                    .padding(.trailing, 14)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(minHeight: 68)
     }
 
     private var homeButton: some View {
         Button(action: selectHome) {
-            HStack(spacing: 9) {
-                AppMark()
-                    .frame(width: 41, height: 41)
-                    .frame(width: 33, height: 33)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Teya")
-                        .font(.logo(9 * max(1, textScale), weight: 500))
-                        .foregroundStyle(.secondary)
-                    Text("Code Station")
-                        .font(.logo(15 * max(1, textScale)))
-                        .kerning(-0.55)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    brand
+                    Spacer(minLength: 0)
+                    runningLabel
                 }
-                .fixedSize()
+                VStack(alignment: .leading, spacing: 8) {
+                    brand
+                    HStack {
+                        Spacer(minLength: 0)
+                        runningLabel
+                    }
+                }
             }
-            .padding(5)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 17)
+            .frame(maxWidth: .infinity, minHeight: 68)
             .background(RoundedRectangle(cornerRadius: 8)
                 .fill(isHome || hovering ? Theme.field : .clear))
-            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.leading, -5)
         .onHover { hovering = $0 }
         .sidebarFocusRing()
         .accessibilityLabel("Teya Code Station home")
+        .accessibilityValue(runningCount > 0 ? "\(runningCount) running sessions" : "")
         .accessibilityAddTraits(isHome ? .isSelected : [])
         .appTooltip("Home")
     }
 
-    private var statusButtons: some View {
-        HStack(spacing: 6) {
-            if runningCount > 0 {
-                SidebarRunningLabel(count: runningCount)
-                    .appMenu(showsFocusRing: true, noticeMenu)
-                    .accessibilityLabel("\(runningCount) running sessions")
-                    .appTooltip("Show active and unread sessions")
+    private var brand: some View {
+        HStack(spacing: 9) {
+            AppMark()
+                .frame(width: 41, height: 41)
+                .frame(width: 33, height: 33)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Teya")
+                    .font(.logo(9 * max(1, textScale), weight: 500))
+                    .foregroundStyle(.secondary)
+                Text("Code Station")
+                    .font(.logo(15 * max(1, textScale)))
+                    .kerning(-0.55)
             }
-            MobileAccessBadge()
         }
         .fixedSize()
     }
-}
 
-private struct SidebarRunningLabel: View {
-    let count: Int
-
-    @Environment(\.menuIsOpen) private var isOpen
-    @State private var hovering = false
-
-    var body: some View {
-        HStack(spacing: 5) {
-            RunningDot(size: 5)
-            Text("\(count) running")
-                .font(.system(size: 9.5, weight: .semibold))
-            Image(systemName: "chevron.down")
-                .font(.system(size: 8, weight: .medium))
+    @ViewBuilder private var runningLabel: some View {
+        if runningCount > 0 {
+            HStack(spacing: 5) {
+                RunningDot(size: 5)
+                Text("\(runningCount) running")
+                    .font(.system(size: 9.5, weight: .semibold))
+            }
+            .foregroundStyle(Theme.accent)
+            .fixedSize()
         }
-        .foregroundStyle(Theme.accent)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Capsule().fill(Theme.accent.opacity(isOpen || hovering ? 0.13 : 0.065)))
-        .overlay(Capsule().stroke(Theme.accent.opacity(isOpen || hovering ? 0.25 : 0.12)))
-        .contentShape(Capsule())
-        .onHover { hovering = $0 }
     }
 }
 
