@@ -1576,7 +1576,11 @@ struct SessionView: View {
             ScrollView {
                 let visibleMessages = transcriptWindow.visibleMessages(in: session.messages)
                 transcriptContent(session, messages: visibleMessages, state: state,
-                                  projectPath: projectPath) {
+                                  projectPath: projectPath,
+                                  reveal: { id in
+                                      transcriptPinnedToBottom = false
+                                      withAnimation(Motion.reveal) { proxy.scrollTo(id, anchor: .top) }
+                                  }) {
                     transcriptWindow.loadEarlier(totalCount: session.messages.count)
                     // Land on the oldest message the page just added, so the reader
                     // starts at the beginning of what they asked for and reads forward
@@ -1715,8 +1719,10 @@ struct SessionView: View {
     private func transcriptContent(_ session: ChatSession,
                                    messages: ArraySlice<ChatMessage>,
                                    state: SessionState, projectPath: String,
+                                   reveal: @escaping (UUID) -> Void = { _ in },
                                    loadEarlier: @escaping () -> Void) -> some View {
         let bubble = appSettings.userMessageStyle(for: session, in: store)
+        let reviewRounds = sentReviews(in: session)
         return VStack(alignment: .leading, spacing: 18) {
             // Only for a session that has nothing to say yet, never for one whose
             // conversation is still being read in.
@@ -1750,6 +1756,11 @@ struct SessionView: View {
             }
 
             ForEach(messages) { message in
+                if let round = reviewRounds.cards[message.id] {
+                    ReviewRoundCard(round: round, fileName: { ($0.path as NSString).lastPathComponent },
+                                    openInChanges: openChanges)
+                        .transition(.fadeIn)
+                } else {
                 MessageView(message: message,
                             projectPath: projectPath,
                             textScale: appSettings.textSize.scale,
@@ -1772,6 +1783,12 @@ struct SessionView: View {
                     .environment(\.activeTranscriptTools, runner.runningTools(sessionID))
                     .environment(\.agentTranscriptFocus, agentFocus)
                     .transition(.fadeIn)
+                }
+                if let followUp = reviewRounds.followUps[message.id] {
+                    reviewFollowUp(followUp.round, answer: followUp.answer, session: session,
+                                   working: state.isBusy, reveal: reveal)
+                        .transition(.fadeIn)
+                }
             }
 
             if !state.isBusy, let ending = runner.lastTurnEnding(sessionID),
@@ -1885,6 +1902,56 @@ struct SessionView: View {
             }
             .transition(.fadeIn)
         }
+    }
+
+    // Reviews sent from Changes, matched to the messages that carried them: each shows as
+    // one card where its prompt would be, and its follow-up closes the turn that took it.
+    private func sentReviews(in session: ChatSession) -> (cards: [UUID: ReviewRound],
+                                                          followUps: [UUID: (round: ReviewRound, answer: UUID?)]) {
+        let rounds = runner.reviews.rounds(sessionID)
+        guard !rounds.isEmpty else { return ([:], [:]) }
+        var cards: [UUID: ReviewRound] = [:]
+        var followUps: [UUID: (round: ReviewRound, answer: UUID?)] = [:]
+        let messages = session.messages
+        for (index, message) in messages.enumerated() where message.role == .user {
+            guard let round = rounds.last(where: { $0.prompt == message.text }) else { continue }
+            cards[message.id] = round
+            var end = index
+            while end + 1 < messages.count, messages[end + 1].role != .user { end += 1 }
+            let answer = messages[(index + 1)...end].last { $0.role == .assistant && !$0.text.isBlank }?.id
+            followUps[messages[end].id] = (round, answer)
+        }
+        return (cards, followUps)
+    }
+
+    private func reviewFollowUp(_ round: ReviewRound, answer: UUID?, session: ChatSession,
+                                working: Bool, reveal: @escaping (UUID) -> Void) -> some View {
+        let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
+        let checker = installed.first { $0 != session.agent } ?? installed.first
+        return ReviewFollowUpCard(
+            round: round, agentTitle: session.agent.title, working: working, checker: checker,
+            fileName: { ($0.path as NSString).lastPathComponent },
+            showChange: { openChange($0.path, root: $0.root) },
+            readAnswer: { if let answer { reveal(answer) } },
+            commentAgain: { runner.reviews.commentAgain($0.id, round: round.id, in: sessionID) },
+            reviewWhatChanged: openChanges,
+            checkFixes: {
+                guard let checker, let executable = runner.executable(for: checker) else { return }
+                let repositories = store.workingDirectories(for: session).map {
+                    ReviewRepository(root: $0, name: ($0 as NSString).lastPathComponent)
+                }
+                runner.reviews.startSecondOpinion(sessionID, agent: checker, request: SecondOpinionRequest(
+                    scope: .sinceReview(trees: round.trees), repositories: repositories, executable: executable))
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                openChanges()
+            })
+            // A round whose turn ended while nothing was watching, or before the app was
+            // last quit, is settled as soon as it is seen.
+            .task(id: "\(round.id)-\(working)") {
+                guard !working, !round.isSettled else { return }
+                await runner.reviews.turnEnded(sessionID, prompt: round.prompt)
+            }
     }
 
     private func returnToHandoff() {

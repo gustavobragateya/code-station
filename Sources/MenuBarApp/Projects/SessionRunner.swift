@@ -2659,6 +2659,11 @@ final class SessionRunner {
         records[sessionID]?.startedGroups = carried
         cleanUp(turn)
         restorePreviousConversation(turn, status: status, sessionID: sessionID, store: store)
+        // A review sent to the session is judged against the files as this turn left them.
+        if turn.summary == nil {
+            let prompt = turn.prompt
+            Task { await reviews.turnEnded(sessionID, prompt: prompt) }
+        }
 
         // Even a recap must stay stopped after exceeding the limit. Starting queued
         // work or a fallback summary here can immediately repeat the memory spike.

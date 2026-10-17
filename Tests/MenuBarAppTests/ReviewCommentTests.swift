@@ -244,22 +244,25 @@ struct ReviewCommentTests {
 
     // MARK: - Drawing
 
-    @Test func numbersCarryTheirLineAndCommentsGetRowsOfTheirOwn() {
-        let note = comment(.new, 11, excerpt: "let first = items.first!", body: "Guard the empty case.")
-        let comments = DiffComments(ReviewPlacement.place([note], in: lines))
-        let text = DiffText.attributed(lines, numbered: true, comments: comments)
-        #expect(text.string.contains("Guard the empty case."))
-
+    @Test func numbersCarryTheirLineAndThreadsGetARowOfTheirOwn() {
+        let text = DiffText.attributed(lines, numbered: true, comments: DiffComments(threads: [3]))
         var keys: Set<String> = []
-        var commentIDs: Set<String> = []
+        var threads: [String] = []
         text.enumerateAttribute(.diffLineAnchor, in: NSRange(location: 0, length: text.length)) { value, _, _ in
             if let key = value as? String { keys.insert(key) }
         }
-        text.enumerateAttribute(.diffComment, in: NSRange(location: 0, length: text.length)) { value, _, _ in
-            if let id = value as? String { commentIDs.insert(id) }
+        text.enumerateAttribute(.diffThread, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+            if let id = value as? String {
+                threads.append(id)
+                #expect(range.length == 1)
+            }
         }
         #expect(keys == ["new:10", "old:11", "new:11", "new:12", "new:13"])
-        #expect(commentIDs == [note.id.uuidString])
+        #expect(threads == ["3"])
+        // The row sits right after the line it hangs from.
+        let rows = text.string.components(separatedBy: "\n")
+        #expect(rows[3].hasSuffix("let first = items.first!"))
+        #expect(rows[4] == " ")
     }
 
     @Test func aDiffWithNowhereToSendCommentsHasNoAnchors() {
@@ -271,11 +274,190 @@ struct ReviewCommentTests {
         #expect(!found)
     }
 
-    @Test func notesWrapOnSpaces() {
-        #expect(DiffText.wrapped("one two three", width: 7) == ["one two", "three"])
-        #expect(DiffText.wrapped("abcdefghij", width: 4) == ["abcd", "efgh", "ij"])
-        #expect(DiffText.wrapped("first\nsecond", width: 40) == ["first", "second"])
+    // MARK: - Findings, kinds and rounds
+
+    @Test func reviewsSavedBeforeFindingsCouldWaitStillLoad() throws {
+        let saved = #"{"id":"\#(UUID().uuidString)","root":"/repo","path":"App.swift","side":"new","line":3,"excerpt":"x","body":"Fix","author":{"you":{}},"created":0}"#
+        let comment = try JSONDecoder().decode(ReviewComment.self, from: Data(saved.utf8))
+        #expect(comment.status == .kept)
+        #expect(comment.kind == .change)
+        #expect(comment.also.isEmpty)
+        #expect(!comment.onFile)
     }
+
+    @Test func aFindingIsNeverSentUntilItIsKept() {
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        store.add(comment(.new, 11, excerpt: "x", body: "Mine"), to: session)
+        var finding = comment(.new, 12, excerpt: "y", body: "Theirs")
+        finding.author = .agent(.codex)
+        store.finishSecondOpinion(session, agent: .codex, outcome: .success([finding]))
+        #expect(store.pending(session).map(\.body) == ["Theirs"])
+        #expect(store.kept(session).map(\.body) == ["Mine"])
+
+        store.keep(finding.id, in: session)
+        #expect(store.pending(session).isEmpty)
+        #expect(store.kept(session).count == 2)
+    }
+
+    @Test func editingAFindingKeepsItAndSaysSo() {
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        var finding = comment(.new, 12, excerpt: "y", body: "Theirs")
+        finding.author = .agent(.copilot)
+        store.addFindings([finding], from: .copilot, to: session)
+        store.update(finding.id, body: "Theirs, in my words", kind: .question, in: session)
+        let kept = store.comment(finding.id, in: session)
+        #expect(kept?.status == .kept)
+        #expect(kept?.edited == true)
+        #expect(kept?.kind == .question)
+    }
+
+    @Test func twoReviewersOnTheSameLinesReadAsOneFinding() {
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        var codex = comment(.new, 12, excerpt: "y", body: "Two pods can send this twice.")
+        codex.author = .agent(.codex)
+        codex.severity = .should
+        var copilot = comment(.new, 12, excerpt: "y", body: "No lock is taken.")
+        copilot.author = .agent(.copilot)
+        copilot.severity = .must
+        var elsewhere = comment(.new, 11, excerpt: "x", body: "Something else.")
+        elsewhere.author = .agent(.copilot)
+        store.addFindings([codex], from: .codex, to: session)
+        let added = store.addFindings([copilot, elsewhere], from: .copilot, to: session)
+        #expect(added == 1)
+        let merged = store.comment(codex.id, in: session)
+        #expect(merged?.also == [.init(agent: .copilot, body: "No lock is taken.")])
+        #expect(merged?.authorName == "Codex and Copilot")
+        #expect(merged?.severity == .must)
+        #expect(store.comments(session).count == 2)
+        #expect(ReviewPrompt.feedback([merged!]).contains("(raised in a Codex and Copilot review)"))
+    }
+
+    @Test func aDismissedFindingComesBackInItsPlace() {
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        let first = comment(.new, 10, excerpt: "a", body: "One")
+        let second = comment(.new, 11, excerpt: "b", body: "Two")
+        let third = comment(.new, 12, excerpt: "c", body: "Three")
+        store.add([first, second, third], to: session)
+        let gone = store.dismiss(second.id, from: session)
+        #expect(store.comments(session).map(\.body) == ["One", "Three"])
+        store.restore(gone!.comment, at: gone!.index, to: session)
+        #expect(store.comments(session).map(\.body) == ["One", "Two", "Three"])
+    }
+
+    @Test func aFailedReviewerLeavesTheOthersFindingsAndCanTryAgain() async throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("no-repo-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        var finding = comment(.new, 12, excerpt: "y", body: "From Codex")
+        finding.author = .agent(.codex)
+        store.finishSecondOpinion(session, agent: .codex, outcome: .success([finding]))
+
+        let request = SecondOpinionRequest(repositories: [ReviewRepository(root: scratch.path, name: "App")],
+                                           executable: "/usr/bin/false")
+        store.startSecondOpinion(session, agent: .copilot, request: request)
+        #expect(store.isReviewing(session, agent: .copilot))
+        #expect(await waitUntil { store.runs(session).first?.state == .failed("There are no changes to review.") })
+        #expect(store.pending(session).map(\.body) == ["From Codex"])
+
+        store.retrySecondOpinion(session, agent: .copilot)
+        #expect(store.runs(session).first?.isRunning == true)
+        store.stopSecondOpinion(session, agent: .copilot)
+        #expect(store.runs(session).isEmpty)
+    }
+
+    @Test func steppingGoesRoundTheReviewInFileOrder() {
+        var other = comment(.new, 1, excerpt: "z", body: "Other file")
+        other.path = "Zed.swift"
+        let removed = comment(.old, 2, excerpt: "a", body: "Removed")
+        let added = comment(.new, 30, excerpt: "b", body: "Added")
+        let ordered = ReviewOrder.sorted([other, removed, added])
+        #expect(ordered.map(\.body) == ["Added", "Removed", "Other file"])
+        #expect(ReviewOrder.step(from: nil, by: 1, in: ordered)?.body == "Added")
+        #expect(ReviewOrder.step(from: nil, by: -1, in: ordered)?.body == "Other file")
+        #expect(ReviewOrder.step(from: other.id, by: 1, in: ordered)?.body == "Added")
+        #expect(ReviewOrder.step(from: added.id, by: -1, in: ordered)?.body == "Other file")
+    }
+
+    @Test func questionsAndTheRoundNoteAreSpelledOut() {
+        var question = comment(.new, 11, excerpt: "x", body: "Why eight attempts?")
+        question.kind = .question
+        var onFile = comment(.new, 40, excerpt: "gone()", body: "Keep the warning.")
+        onFile.onFile = true
+        let prompt = ReviewPrompt.feedback([question, onFile], note: " Run the tests when you are done. ")
+        #expect(prompt.contains("A comment marked as a question only needs an answer, not a code change."))
+        #expect(prompt.contains("App.swift, line 11 (a question)"))
+        #expect(prompt.contains("App.swift, the whole file"))
+        #expect(prompt.hasSuffix("One more thing: Run the tests when you are done."))
+        #expect(!ReviewPrompt.feedback([comment(.new, 11, excerpt: "x")]).contains("question"))
+    }
+
+    @Test func aCommentWhoseCodeWasLeftAloneWasNotChanged() {
+        let note = comment(.new, 2, excerpt: "let first = items.first!", body: "Guard it")
+        let file = "let items = load()\nlet first = items.first!\nreturn first"
+        #expect(ReviewRound.outcome(for: note, fileText: file, digestAtSend: nil) == .unchanged)
+        let edited = "let items = load()\nguard let first = items.first else { return nil }\nreturn first"
+        #expect(ReviewRound.outcome(for: note, fileText: edited, digestAtSend: nil) == .changed)
+        let moved = "// header\nlet items = load()\nlet first = items.first!\nreturn first"
+        #expect(ReviewRound.outcome(for: note, fileText: moved, digestAtSend: nil) == .changed)
+        #expect(ReviewRound.outcome(for: note, fileText: nil, digestAtSend: nil) == .changed)
+        var question = note
+        question.kind = .question
+        #expect(ReviewRound.outcome(for: question, fileText: file, digestAtSend: nil) == .answered)
+        let removed = comment(.old, 2, excerpt: "let first = items[0]", body: "Why?")
+        #expect(ReviewRound.outcome(for: removed, fileText: file, digestAtSend: ReviewRound.digest(file)) == .unchanged)
+        #expect(ReviewRound.outcome(for: removed, fileText: edited, digestAtSend: ReviewRound.digest(file)) == .changed)
+    }
+
+    @Test func aSentReviewIsSettledWhenItsTurnEndsAndCanBeCommentedAgain() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("review-\(UUID().uuidString).json")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension("rounds.json"))
+        }
+        let store = ReviewCommentStore(url: url)
+        let files = FileBox(["/repo/App.swift": "let items = load()\nlet first = items.first!\nreturn first"])
+        store.readFile = { files.read($0) }
+        let session = UUID()
+        let untouched = comment(.new, 2, excerpt: "let first = items.first!", body: "Guard it")
+        var question = comment(.new, 3, excerpt: "return first", body: "Why return here?")
+        question.kind = .question
+        let unsent = comment(.new, 1, excerpt: "let items = load()", body: "Later")
+        store.add([untouched, question, unsent], to: session)
+
+        let prompt = ReviewPrompt.feedback([untouched, question])
+        let round = store.recordRound([untouched, question], prompt: prompt, note: "", roots: [], in: session)
+        #expect(store.comments(session).map(\.body) == ["Later"])
+        #expect(store.round(prompt: "  " + prompt + "\n", in: session)?.id == round.id)
+
+        await store.turnEnded(session, prompt: "Something else")
+        #expect(store.rounds(session).first?.isSettled == false)
+        await store.turnEnded(session, prompt: prompt)
+        let outcomes = try #require(store.rounds(session).first?.outcomes)
+        #expect(outcomes[untouched.id] == .unchanged)
+        #expect(outcomes[question.id] == .answered)
+
+        store.commentAgain(untouched.id, round: round.id, in: session)
+        store.commentAgain(untouched.id, round: round.id, in: session)
+        #expect(store.kept(session).map(\.body) == ["Later", "Guard it"])
+        store.flush()
+
+        let reopened = ReviewCommentStore(url: url)
+        #expect(reopened.rounds(session).first?.returned == [untouched.id])
+        #expect(reopened.rounds(session).first?.outcomes?[question.id] == .answered)
+    }
+}
+
+// Hands a test's made-up files to the store in place of the disk.
+private final class FileBox: @unchecked Sendable {
+    let files: [String: String]
+    init(_ files: [String: String]) { self.files = files }
+    func read(_ path: String) -> String? { files[path] }
 }
 
 // Another agent's review comes back as text that should be a JSON array of findings,
@@ -414,5 +596,62 @@ struct SecondOpinionTests {
             #expect(granted == roots)
             #expect(arguments.contains("--deny-tool=write"))
         }
+    }
+
+    @Test func findingsArriveWaitingWithTheirSeverity() {
+        let findings = [SecondOpinion.Finding(file: "Sources/App.swift", line: 11, comment: "Crashes.", severity: "MUST")]
+        let comments = SecondOpinion.comments(from: findings, patches: [patch], agent: .codex)
+        #expect(comments.first?.status == .pending)
+        #expect(comments.first?.severity == .must)
+        let read = SecondOpinion.findings(in: #"[{"file":"a","line":1,"severity":"look","comment":"c"}]"#)
+        #expect(read?.first?.severity == "look")
+    }
+
+    @Test func thePromptAsksForWhatWasPickedAndHowMuchItMatters() {
+        let prompt = SecondOpinion.prompt(for: [patch], focus: [.missingTests, .bugs])
+        #expect(prompt.contains("bugs and broken behaviour; behaviour the change adds or alters with no test covering it"))
+        #expect(!prompt.contains("security issues"))
+        #expect(prompt.contains(#""severity": "must" | "should" | "look""#))
+        #expect(!prompt.contains("last review was sent"))
+        #expect(SecondOpinion.prompt(for: [patch], sinceReview: true).contains("after the author's last review was sent"))
+    }
+
+    @Test func aPatchOfManyFilesSplitsIntoOnePerFile() {
+        let text = """
+        diff --git a/App.swift b/App.swift
+        --- a/App.swift
+        +++ b/App.swift
+        @@ -1 +1 @@
+        -old
+        +new
+        diff --git a/Gone.swift b/Gone.swift
+        deleted file mode 100644
+        --- a/Gone.swift
+        +++ /dev/null
+        @@ -1 +0,0 @@
+        -bye
+        """
+        let patches = SecondOpinion.split(text, root: "/repo")
+        #expect(patches.map(\.path) == ["App.swift", "Gone.swift"])
+        #expect(patches.map(\.deleted) == [false, true])
+        #expect(patches[0].text.hasPrefix("diff --git a/App.swift"))
+        #expect(SecondOpinion.newLines(in: patches[0].text)[1] == "new")
+    }
+
+    @Test func aLaneSaysWhatTheReviewerIsReading() {
+        func tool(_ name: String, _ input: String) -> ToolUse { ToolUse(id: "1", name: name, input: input) }
+        #expect(SecondOpinion.activity(for: tool("Read", #"{"file_path":"/repo/Sources/App.swift"}"#)) == "Reading App.swift")
+        #expect(SecondOpinion.activity(for: tool("Grep", #"{"pattern":"retryDue"}"#)) == "Searching for retryDue")
+        #expect(SecondOpinion.activity(for: tool("Bash", #"{"command":"rg -n retry src extra"}"#)) == "Running rg -n retry")
+        #expect(SecondOpinion.activity(for: tool("WebFetch", "{}")) == "Using WebFetch")
+    }
+
+    @Test func claudeStreamsSoItsLaneCanFollowIt() {
+        let claude = SecondOpinion.arguments(for: .claudeCode, prompt: "p")
+        #expect(claude.contains("stream-json"))
+        #expect(claude.contains("--verbose"))
+        let stream = #"{"type":"assistant","message":{"content":[{"type":"text","text":"[]"}]}}"# + "\n"
+            + #"{"type":"result","subtype":"success","result":"[]","is_error":false}"#
+        #expect(SecondOpinion.answer(from: stream, agent: .claudeCode) == "[]")
     }
 }

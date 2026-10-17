@@ -84,16 +84,45 @@ final class TreeSnapshots: @unchecked Sendable {
         }
     }
 
-    private func take(at path: String, using git: GitInspector.GitTool) -> WrittenChange? {
-        guard let root = root(of: path, using: git) else { return nil }
-        var checkout = checkouts[root] ?? Checkout(indexPath: Self.indexPath(for: root))
-        guard !checkout.isTooSlow else { return nil }
-        defer { checkouts[root] = checkout }
+    // MARK: - Recording a moment to come back to
 
-        let started = Date()
+    // The tree the checkout holds right now, written the same way but without moving the
+    // point the next call is measured from, so a call running meanwhile keeps its change.
+    func record(at path: String) async -> String? {
+        guard let git = await GitInspector.tool() else { return nil }
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                guard let root = self.root(of: path, using: git) else { return continuation.resume(returning: nil) }
+                var checkout = self.checkouts[root] ?? Checkout(indexPath: Self.indexPath(for: root))
+                let tree = Self.writeTree(root: root, checkout: checkout, using: git)
+                if checkout.tree == nil { checkout.tree = tree }
+                self.checkouts[root] = checkout
+                continuation.resume(returning: tree)
+            }
+        }
+    }
+
+    // What changed in a checkout between a recorded tree and now, as one unified patch,
+    // with paths relative to the top of the repository. Nil when git could not say.
+    func patch(since tree: String, at path: String) async -> (root: String, text: String)? {
+        guard let git = await GitInspector.tool() else { return nil }
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                guard let root = self.root(of: path, using: git) else { return continuation.resume(returning: nil) }
+                let checkout = self.checkouts[root] ?? Checkout(indexPath: Self.indexPath(for: root))
+                guard let now = Self.writeTree(root: root, checkout: checkout, using: git) else {
+                    return continuation.resume(returning: nil)
+                }
+                let patch = GitInspector.run(git, ["diff-tree", "-r", "-p", "-M", "--no-color", tree, now],
+                                             in: URL(fileURLWithPath: root))
+                continuation.resume(returning: patch.ok && !patch.truncated ? (root, patch.text) : nil)
+            }
+        }
+    }
+
+    private static func writeTree(root: String, checkout: Checkout, using git: GitInspector.GitTool) -> String? {
         let url = URL(fileURLWithPath: root)
         let environment = ["GIT_INDEX_FILE": checkout.indexPath]
-
         // A brand new index knows nothing about the checkout, and filling it from the last
         // commit is far cheaper than letting the first `add` hash every file. A repository
         // with no commits yet has nothing to fill it from, which only costs one slow first
@@ -106,9 +135,19 @@ final class TreeSnapshots: @unchecked Sendable {
                                                   environment: environment),
               written.ok
         else { return nil }
-
         let tree = written.trimmedText
-        guard !tree.isEmpty else { return nil }
+        return tree.isEmpty ? nil : tree
+    }
+
+    private func take(at path: String, using git: GitInspector.GitTool) -> WrittenChange? {
+        guard let root = root(of: path, using: git) else { return nil }
+        var checkout = checkouts[root] ?? Checkout(indexPath: Self.indexPath(for: root))
+        guard !checkout.isTooSlow else { return nil }
+        defer { checkouts[root] = checkout }
+
+        let started = Date()
+        let url = URL(fileURLWithPath: root)
+        guard let tree = Self.writeTree(root: root, checkout: checkout, using: git) else { return nil }
 
         let cost = Date().timeIntervalSince(started)
         if cost > Self.slowSnapshot {

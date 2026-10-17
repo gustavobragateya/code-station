@@ -97,6 +97,13 @@ final class ChangesNavigationMemory {
     var commits: [String: [GitCommitSummary]] = [:]
     var collapsedHistories: Set<String> = []
     var historyFilter = ""
+    // The navigator lists the review instead of the files. Kept here, with the comment in
+    // focus, because each project gets a screen of its own and stepping through a review
+    // moves between them.
+    var showingReview = false
+    var reviewFilter = ReviewFilter.all
+    var focusedComment: UUID?
+    var secondOpinionFocus = Set(SecondOpinion.Focus.standard)
 
     func history(for root: String) -> CommitHistorySelection {
         if let selection = histories[root] { return selection }
@@ -118,6 +125,20 @@ struct ChangesRepository: Identifiable {
     }
 }
 
+// Which comments the review list shows.
+enum ReviewFilter: Hashable {
+    case all, pending, yours, reviewers
+
+    func admits(_ comment: ReviewComment) -> Bool {
+        switch self {
+        case .all: true
+        case .pending: comment.isPending
+        case .yours: comment.reviewer == nil
+        case .reviewers: comment.reviewer != nil
+        }
+    }
+}
+
 // Where comments left on a diff go: the session whose changes these are, and its agent.
 // A project's own Changes screen has no agent to answer them, so it takes none.
 struct ReviewTarget {
@@ -130,9 +151,8 @@ struct ReviewTarget {
     var isBusy: () -> Bool = { false }
     // Hands the finished review to the session as one prompt.
     var send: (String) -> Void = { _ in }
-    // Called once a review has been sent, so the screen can go back to the conversation
-    // and show the agent taking it up.
-    var sent: () -> Void = {}
+    // Goes back to the conversation, to watch the agent take a sent review up.
+    var openChat: () -> Void = {}
 }
 
 // A comment being written or edited, and the lines it is about.
@@ -144,6 +164,7 @@ struct CommentDraft: Equatable {
     var excerpt = ""
     var excerptOffsets: [Int]?
     var text = ""
+    var kind = ReviewComment.Kind.change
     // The comment being edited, or nil for a new one.
     var editing: UUID?
 }
@@ -193,7 +214,28 @@ struct ChangesView: View {
     @Environment(AppSettings.self) private var appSettings
 
     @State private var commentDraft: CommentDraft?
-    @FocusState private var commentFocused: Bool
+    @State private var toast: ReviewToast?
+    @State private var showsPicker = false
+    @State private var pickerReviewers: Set<AgentKind> = []
+    @State private var pickerScope = SecondOpinionScopeChoice.all
+    // An unplaced comment waiting for a line number to be clicked to move onto.
+    @State private var reattaching: UUID?
+    // Bumped to scroll the diff to the focused comment again, even when it has not moved.
+    @State private var revealSerial = 0
+    @State private var reviewKeys = WindowKeyHandler()
+    @AppStorage("changes.reviewCoachSeen") private var coachSeen = false
+    private var showingReview: Bool {
+        get { navigation.showingReview }
+        nonmutating set { navigation.showingReview = newValue }
+    }
+    private var reviewFilter: ReviewFilter {
+        get { navigation.reviewFilter }
+        nonmutating set { navigation.reviewFilter = newValue }
+    }
+    private var focusedComment: UUID? {
+        get { navigation.focusedComment }
+        nonmutating set { navigation.focusedComment = newValue }
+    }
 
     @State private var copied: GitInspector.CopyVersion?
     @State private var copiedPath: String?
@@ -318,8 +360,34 @@ struct ChangesView: View {
                     }
                 }
             }
+            .overlay {
+                // A click anywhere outside the picker puts it away, the way a menu goes.
+                // The picker floats over this area from the review bar below, which is
+                // drawn above it, so the click lands here only when it misses the card.
+                if showsPicker {
+                    Color.black.opacity(0.001)
+                        .onTapGesture { showsPicker = false }
+                }
+            }
             if let review, mode == .changes, !files.isEmpty || !review.reviews.comments(review.sessionID).isEmpty {
                 reviewStrip(review)
+                    .overlay(alignment: .topTrailing) {
+                        if showsPicker {
+                            secondOpinionPicker(review)
+                                .padding(.trailing, 20)
+                                .alignmentGuide(.top) { $0[.bottom] + 8 }
+                                .transition(.opacity.combined(with: .offset(y: 6)))
+                        }
+                    }
+                    .overlay(alignment: .top) {
+                        if let toast {
+                            ReviewToastView(toast: toast) { self.toast = nil }
+                                .alignmentGuide(.top) { $0[.bottom] + 10 }
+                                .transition(.opacity)
+                                .id(toast.id)
+                        }
+                    }
+                    .zIndex(1)
             }
             if let checkedAt {
                 HStack {
@@ -335,6 +403,19 @@ struct ChangesView: View {
             }
         }
         .background(Theme.background)
+        .background(WindowKeyAnchor(handler: reviewKeys))
+        .motion(Motion.reveal, value: showsPicker)
+        .motion(Motion.reveal, value: toast?.id)
+        .task(id: toast?.id) {
+            guard let toast else { return }
+            try? await Task.sleep(for: .seconds(toast.action == nil ? 3.2 : 6))
+            if self.toast?.id == toast.id { self.toast = nil }
+        }
+        .onAppear { reviewKeys.start { handleReviewKey($0) } }
+        .onDisappear { reviewKeys.stop() }
+        .onChange(of: review.map { $0.reviews.runs($0.sessionID) } ?? []) { old, new in
+            reportFinishedRuns(old: old, new: new)
+        }
         // The screen opens on the last snapshot taken of this tree while a fresh one
         // is fetched, so the file list is there at first glance instead of after git.
         .task(id: root) {
@@ -352,9 +433,10 @@ struct ChangesView: View {
         // The open diff is one attributed string built when the file was picked, so its
         // font is baked in and a new reading size only reaches it by building it again.
         .onChange(of: appSettings.textSize) { _, _ in reopenDiff() }
-        // The comments are drawn into the diff's text, so a new, edited or deleted one is
-        // only seen once the text is built again. The reader stays where they were.
-        .onChange(of: openFileComments) { _, _ in
+        // The text keeps an empty row under each line a thread hangs from, so a thread
+        // that comes or goes is only seen once the text is built again. The reader stays
+        // where they were.
+        .onChange(of: threadLineIDs) { _, _ in
             diffScroll = .hold
             Task { await renderDiff() }
         }
@@ -619,6 +701,36 @@ struct ChangesView: View {
     private var workspaceNavigator: some View {
         VStack(spacing: 0) {
             if mode == .history { historyFilterField }
+            if mode == .changes, let review {
+                let count = review.reviews.comments(review.sessionID).count
+                let pending = !review.reviews.pending(review.sessionID).isEmpty
+                HStack(spacing: 4) {
+                    ChoicePill(title: "Files \(navigatorFileCount)", selected: !showingReview) { showingReview = false }
+                    ChoicePill(title: count > 0 ? "Review \(count)" : "Review", selected: showingReview,
+                               dot: pending ? Theme.attention : nil) { showingReview = true }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12).padding(.top, 12)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Show")
+            }
+            if mode == .changes, showingReview, let review {
+                reviewNavigator(review)
+            } else {
+                filesNavigator
+            }
+        }
+        .background(Theme.card)
+    }
+
+    private var navigatorFileCount: Int {
+        repositories.reduce(0) { total, repository in
+            total + ((repository.root == root ? snapshot : gitStats.snapshot(at: repository.root))?.files.count ?? 0)
+        }
+    }
+
+    private var filesNavigator: some View {
+        VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 3) {
@@ -1146,12 +1258,16 @@ struct ChangesView: View {
                 }
 
                 if let review {
-                    let comments = review.reviews.count(review.sessionID, root: repoRoot, path: file.path)
-                    if comments > 0 {
-                        Label("\(comments)", systemImage: "text.bubble")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(Theme.accent)
-                            .appTooltip(counted(comments, "review comment"))
+                    let comments = review.reviews.comments(review.sessionID, root: repoRoot, path: file.path)
+                    if !comments.isEmpty {
+                        let pending = comments.contains(where: \.isPending)
+                        HStack(spacing: 3) {
+                            Label("\(comments.count)", systemImage: "text.bubble")
+                            if pending { Circle().fill(Theme.attention).frame(width: 5, height: 5) }
+                        }
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(pending ? Theme.attentionText : Theme.accent)
+                        .appTooltip(counted(comments.count, "review comment") + (pending ? ", some still to look at" : ""))
                     }
                 }
 
@@ -1217,6 +1333,7 @@ struct ChangesView: View {
                 title()
                 Spacer()
                 if loadingDiff { ProgressView().controlSize(.small) }
+                if mode == .changes, review != nil, !orderedComments.isEmpty { commentNavigation }
                 if mode == .changes, let file = selected {
                     Image(systemName: "ellipsis").padding(8).contentShape(Rectangle())
                         .appMenu {
@@ -1257,13 +1374,18 @@ struct ChangesView: View {
                     }.padding(.horizontal, 20).padding(.vertical, 8)
                 }
             }
-            if mode == .changes, review != nil, !placement.unplaced.isEmpty {
-                unplacedComments(placement.unplaced)
+            if mode == .changes, let review {
+                let placement = placement
+                if !placement.unplaced.isEmpty { unplacedComments(placement.unplaced, review: review) }
+                if !placement.onFile.isEmpty { fileComments(placement.onFile, review: review) }
             }
             diffBody(truncationHint: truncationHint)
-            if mode == .changes, review != nil, let draft = commentDraft, draft.path == selected?.path {
-                commentBar(draft)
-            }
+                .overlay(alignment: .topLeading) {
+                    if mode == .changes, review != nil, !coachSeen, diff?.lines.isEmpty == false,
+                       orderedComments.isEmpty, commentDraft == nil {
+                        coachMark.padding(.leading, 70).padding(.top, 40)
+                    }
+                }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.card)
@@ -1283,25 +1405,28 @@ struct ChangesView: View {
             PaneMessage(icon: "doc", title: "No content changes",
                         detail: "This file may have metadata changes or changes confined to the index.")
         } else if mode == .changes, appSettings.changesDiffLayout == .sideBySide, let diff {
-            if review != nil {
-                SideBySideDiff(lines: diff.lines, expand: expand, comments: placement, picked: pickedKeys,
-                               onLine: { pickLine($0, extending: $1) }, onComment: { openComment($0) })
+            if let review {
+                SideBySideDiff(lines: diff.lines, expand: expand, threads: threadViews(review), picked: pickedKeys,
+                               onLine: { pickLine($0, extending: $1) }, onRange: { pickRange($0) },
+                               reveal: revealedLine)
             } else {
                 SideBySideDiff(lines: diff.lines, expand: expand)
             }
         } else if let diffText {
-            if mode == .changes, review != nil {
+            if mode == .changes, let review {
                 DiffTextView(text: diffText, scroll: diffScroll,
                              onExpand: { expand($0, $1) },
                              onLine: { key, extending in
                                  if let anchor = DiffComments.anchor(key) { pickLine(anchor, extending: extending) }
                              },
-                             onComment: { id in
-                                 if let comment = openFileComments.first(where: { $0.id.uuidString == id }) {
-                                     openComment(comment)
+                             onRange: { start, end in
+                                 if let first = DiffComments.anchor(start), let last = DiffComments.anchor(end) {
+                                     pickRange(first.extended(to: last))
                                  }
                              },
-                             picked: pickedKeys)
+                             picked: pickedKeys,
+                             threads: threadViews(review),
+                             reveal: revealedLine)
             } else {
                 DiffTextView(text: diffText, scroll: diffScroll) { gap, direction in
                     expand(gap, direction)
@@ -1811,14 +1936,111 @@ struct ChangesView: View {
         commentDraft.map { DiffComments.keys($0.anchor) } ?? []
     }
 
+    // Every comment in the review, in the order they are read and stepped through.
+    private var orderedComments: [ReviewComment] {
+        guard let review else { return [] }
+        return ReviewOrder.sorted(review.reviews.comments(review.sessionID), roots: repositories.map(\.root))
+    }
+
+    // The id of the diff line a new comment's composer opens under: the last of its lines.
+    private func lineID(for anchor: DiffAnchor, in lines: [DiffLine]) -> Int? {
+        let last = anchor.lastLine ?? anchor.line
+        return NumberedDiffLine.lines(lines).first { $0.side == anchor.side && $0.number == last }?.id
+    }
+
+    // The lines a thread hangs from: those with comments placed under them, and the one a
+    // comment is being written about.
+    private func threadLines(placement: ReviewPlacement, lines: [DiffLine]) -> Set<Int> {
+        var ids = Set(placement.below.keys)
+        if let draft = commentDraft, draft.path == selected?.path, draft.editing == nil,
+           let id = lineID(for: draft.anchor, in: lines) {
+            ids.insert(id)
+        }
+        return ids
+    }
+
+    private var threadLineIDs: Set<Int> {
+        guard review != nil, mode == .changes, let diff else { return [] }
+        return threadLines(placement: placement, lines: diff.lines)
+    }
+
     private func diffComments(for file: GitChange?, lines: [DiffLine]) -> DiffComments? {
         guard let review else { return nil }
         let comments = file.map { review.reviews.comments(review.sessionID, root: repoRoot, path: $0.path) } ?? []
-        return DiffComments(ReviewPlacement.place(comments, in: lines))
+        return DiffComments(threads: threadLines(placement: ReviewPlacement.place(comments, in: lines), lines: lines))
+    }
+
+    // What hangs under each line: its cards, and the composer where one is being written.
+    // An existing comment opened to edit turns into the composer in its own place.
+    private func threadViews(_ review: ReviewTarget) -> [Int: AnyView] {
+        guard let diff else { return [:] }
+        let placement = placement
+        var views: [Int: AnyView] = [:]
+        let draftLine: Int? = {
+            guard let draft = commentDraft, draft.path == selected?.path else { return nil }
+            if let editing = draft.editing {
+                return placement.below.first { $0.value.contains { $0.id == editing } }?.key
+            }
+            return lineID(for: draft.anchor, in: diff.lines)
+        }()
+        for id in threadLines(placement: placement, lines: diff.lines) {
+            let comments = placement.below[id] ?? []
+            views[id] = AnyView(VStack(alignment: .leading, spacing: 8) {
+                ForEach(comments) { comment in
+                    if commentDraft?.editing == comment.id {
+                        composer(review)
+                    } else {
+                        card(comment, review: review)
+                    }
+                }
+                if draftLine == id, commentDraft?.editing == nil { composer(review) }
+            })
+        }
+        return views
+    }
+
+    private var revealedLine: DiffReveal? {
+        guard let focusedComment,
+              let line = placement.below.first(where: { $0.value.contains { $0.id == focusedComment } })?.key
+        else { return nil }
+        return DiffReveal(line: line, serial: revealSerial)
+    }
+
+    private func card(_ comment: ReviewComment, review: ReviewTarget, showsLines: Bool = true) -> some View {
+        ReviewCommentCard(comment: comment, focused: focusedComment == comment.id, showsLines: showsLines,
+                          onEdit: { openComment(comment) },
+                          onDelete: { deleteComment(comment) },
+                          onKeep: { keep(comment) },
+                          onDismiss: { dismiss(comment) })
+            .onTapGesture { focusedComment = comment.id }
+    }
+
+    @ViewBuilder private func composer(_ review: ReviewTarget) -> some View {
+        if let draft = commentDraft {
+            let editing = draft.editing.flatMap { review.reviews.comment($0, in: review.sessionID) }
+            let finding = editing?.isPending == true ? editing : nil
+            ReviewComposer(
+                text: Binding(get: { commentDraft?.text ?? "" }, set: { commentDraft?.text = $0 }),
+                kind: Binding(get: { commentDraft?.kind ?? .change }, set: { commentDraft?.kind = $0 }),
+                title: finding.map { "Edit \($0.authorName)'s finding" } ?? (editing == nil ? "New comment" : "Edit comment"),
+                linesLabel: draft.anchor.label,
+                agentTitle: review.agent.title,
+                action: finding != nil ? "Keep with my edits" : editing == nil ? "Add comment" : "Save",
+                stretches: editing == nil,
+                onDelete: editing != nil && finding == nil ? { if let editing { deleteComment(editing) } } : nil,
+                onSave: saveComment,
+                onCancel: { commentDraft = nil })
+        }
     }
 
     private func pickLine(_ anchor: DiffAnchor, extending: Bool) {
         guard let file = selected else { return }
+        if let id = reattaching {
+            moveUnplaced(id, to: anchor)
+            return
+        }
+        coachSeen = true
+        focusedComment = nil
         // A saved comment keeps the lines it was left on, so only a new one stretches.
         if extending, let draft = commentDraft, draft.path == file.path, draft.editing == nil {
             let stretched = draft.anchor.extended(to: anchor)
@@ -1826,19 +2048,34 @@ struct ChangesView: View {
             commentDraft?.anchor = stretched
             commentDraft?.excerpt = quote.text
             commentDraft?.excerptOffsets = quote.offsets
-        } else if commentDraft?.path == file.path, commentDraft?.editing == nil,
-                  commentDraft?.text.isBlank == false {
-            // A note part way written moves to the new line rather than being dropped.
-            let quote = excerpt(anchor)
+        } else {
+            openDraft(at: anchor, in: file)
+        }
+    }
+
+    // A drag down the numbers picks the whole run at once.
+    private func pickRange(_ anchor: DiffAnchor) {
+        guard let file = selected else { return }
+        if let id = reattaching {
+            moveUnplaced(id, to: anchor)
+            return
+        }
+        coachSeen = true
+        focusedComment = nil
+        openDraft(at: anchor, in: file)
+    }
+
+    // A note part way written moves to the new lines rather than being dropped.
+    private func openDraft(at anchor: DiffAnchor, in file: GitChange) {
+        let quote = excerpt(anchor)
+        if let draft = commentDraft, draft.path == file.path, draft.editing == nil, !draft.text.isBlank {
             commentDraft?.anchor = anchor
             commentDraft?.excerpt = quote.text
             commentDraft?.excerptOffsets = quote.offsets
         } else {
-            let quote = excerpt(anchor)
             commentDraft = CommentDraft(anchor: anchor, path: file.path, excerpt: quote.text,
                                         excerptOffsets: quote.offsets)
         }
-        commentFocused = true
     }
 
     // A diff read again under a note being written can have moved its lines. The note
@@ -1854,10 +2091,18 @@ struct ChangesView: View {
     }
 
     private func openComment(_ comment: ReviewComment) {
+        guard comment.root == repoRoot else {
+            focus(comment)
+            return
+        }
+        if selected?.path != comment.path, let file = files.first(where: { $0.path == comment.path }) {
+            mode = .changes
+            select(file)
+        }
+        focusedComment = nil
         commentDraft = CommentDraft(anchor: comment.anchor, path: comment.path,
                                     excerpt: comment.excerpt, excerptOffsets: comment.excerptOffsets,
-                                    text: comment.body, editing: comment.id)
-        commentFocused = true
+                                    text: comment.body, kind: comment.kind, editing: comment.id)
     }
 
     // The code a comment is about, quoted with it so the agent sees what was meant even
@@ -1869,115 +2114,283 @@ struct ChangesView: View {
     private func saveComment() {
         guard let review, let draft = commentDraft, !draft.text.isBlank else { return }
         if let id = draft.editing {
-            review.reviews.update(id, body: draft.text.trimmed, in: review.sessionID)
+            let wasPending = review.reviews.comment(id, in: review.sessionID)?.isPending == true
+            review.reviews.update(id, body: draft.text.trimmed, kind: draft.kind, in: review.sessionID)
+            commentDraft = nil
+            if wasPending {
+                announce("Kept with your edits")
+                afterTriage(from: id)
+                return
+            }
+            announce("Comment saved")
         } else {
             review.reviews.add(ReviewComment(root: repoRoot, path: draft.path, anchor: draft.anchor,
-                                      excerpt: draft.excerpt, body: draft.text.trimmed,
-                                      excerptOffsets: draft.excerptOffsets),
-                        to: review.sessionID)
+                                             excerpt: draft.excerpt, body: draft.text.trimmed,
+                                             excerptOffsets: draft.excerptOffsets, kind: draft.kind),
+                               to: review.sessionID)
+            commentDraft = nil
+            announce("Comment added")
         }
-        commentDraft = nil
-        announce("Comment saved")
     }
 
-    private func deleteComment() {
-        guard let review, let id = commentDraft?.editing else { return }
-        review.reviews.remove(id, from: review.sessionID)
-        commentDraft = nil
+    private func deleteComment(_ comment: ReviewComment) {
+        guard let review else { return }
+        review.reviews.remove(comment.id, from: review.sessionID)
+        if commentDraft?.editing == comment.id { commentDraft = nil }
+        if focusedComment == comment.id { focusedComment = nil }
         announce("Comment deleted")
     }
 
-    private func commentBar(_ draft: CommentDraft) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "text.bubble").font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Theme.accent)
-                Text(draft.editing == nil ? "New comment" : "Edit comment")
-                    .font(.system(size: 12, weight: .semibold))
-                Text(draft.anchor.label).font(.mono(11)).foregroundStyle(.secondary)
-                if draft.editing == nil {
-                    Text("Shift-click another line number to cover a range")
-                        .font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-            }
-            TextField("What should \(review?.agent.title ?? "the agent") change here?",
-                      text: Binding(get: { commentDraft?.text ?? "" }, set: { commentDraft?.text = $0 }),
-                      axis: .vertical)
-                .lineLimit(1...6)
-                .appTextField()
-                .focused($commentFocused)
-                .onSubmit { saveComment() }
-                .onExitCommand { commentDraft = nil }
-            HStack(spacing: 14) {
-                if draft.editing != nil {
-                    InlineLink(title: "Delete", tint: Theme.deletion) { deleteComment() }
-                }
-                Spacer()
-                InlineLink(title: "Cancel", tint: Color.secondary) { commentDraft = nil }
-                ActionButton(title: draft.editing == nil ? "Add comment" : "Save", height: 28, size: 12) {
-                    saveComment()
-                }
-                .disabled(draft.text.isBlank)
-            }
+    // MARK: Moving through the review
+
+    // Puts a comment in focus and brings it on screen, opening its file, or its project,
+    // first if it is elsewhere.
+    private func focus(_ comment: ReviewComment) {
+        focusedComment = comment.id
+        revealSerial += 1
+        if commentDraft?.editing != nil || commentDraft?.text.isBlank != false { commentDraft = nil }
+        guard comment.root == repoRoot else {
+            selectRepository(comment.root, comment.path)
+            return
         }
-        .padding(.horizontal, 20).padding(.vertical, 10)
-        .background(Theme.card)
-        .overlay(alignment: .top) { Rectangle().fill(Theme.hairline).frame(height: 1) }
-        .onAppear { commentFocused = true }
+        if selected?.path != comment.path, let file = files.first(where: { $0.path == comment.path }) {
+            mode = .changes
+            select(file)
+        }
+        announce(comment.spokenName)
     }
 
-    private func unplacedComments(_ comments: [ReviewComment]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Comments on lines this diff no longer shows")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+    private func step(_ by: Int, onlyPending: Bool = false) {
+        let list = orderedComments.filter { !onlyPending || $0.isPending }
+        guard let next = ReviewOrder.step(from: list.contains { $0.id == focusedComment } ? focusedComment : nil,
+                                          by: by, in: list) else { return }
+        focus(next)
+    }
+
+    private func nextPending() {
+        showingReview = true
+        if reviewFilter == .yours { reviewFilter = .all }
+        step(1, onlyPending: true)
+    }
+
+    // After a finding is sorted, focus moves on to the next one still waiting, so a whole
+    // set can be sorted from the keyboard without looking for the next.
+    private func afterTriage(from id: UUID) {
+        guard let review else { return }
+        let ordered = orderedComments
+        let pending = ordered.filter(\.isPending)
+        guard !pending.isEmpty else {
+            focusedComment = nil
+            showToast("All findings sorted. \(counted(review.reviews.kept(review.sessionID).count, "comment")) ready to send.")
+            return
+        }
+        // The next waiting one after where this one stood, going round to the first.
+        let after = ordered.firstIndex { $0.id == id }.map { index in
+            ordered[(index + 1)...].first(where: \.isPending)
+        } ?? nil
+        focus(after ?? pending[0])
+    }
+
+    private func keep(_ comment: ReviewComment) {
+        guard let review else { return }
+        review.reviews.keep(comment.id, in: review.sessionID)
+        announce("Kept \(comment.authorName)'s finding")
+        afterTriage(from: comment.id)
+    }
+
+    private func dismiss(_ comment: ReviewComment) {
+        guard let review, let gone = review.reviews.dismiss(comment.id, from: review.sessionID) else { return }
+        let sessionID = review.sessionID
+        let reviews = review.reviews
+        afterTriage(from: comment.id)
+        showToast("Dismissed \(comment.authorName)'s finding", action: "Undo") {
+            reviews.restore(gone.comment, at: gone.index, to: sessionID)
+            focus(gone.comment)
+        }
+    }
+
+    // The keys that move through a review and sort what is in it. Single letters only
+    // count while a finding is in focus and nothing is being typed.
+    private func handleReviewKey(_ event: NSEvent) -> Bool {
+        guard let review, mode == .changes, dialogs.current == nil, !showsPicker else { return false }
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if flags == .option, event.keyCode == 125 || event.keyCode == 126 {
+            step(event.keyCode == 125 ? 1 : -1)
+            return true
+        }
+        guard flags.isEmpty, let id = focusedComment,
+              let comment = review.reviews.comment(id, in: review.sessionID) else { return false }
+        if event.keyCode == 53 {
+            focusedComment = nil
+            return true
+        }
+        guard comment.isPending else { return false }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "k": keep(comment)
+        case "e": openComment(comment)
+        case "d": dismiss(comment)
+        default: return false
+        }
+        return true
+    }
+
+    private func showToast(_ text: String, action title: String? = nil, perform: (() -> Void)? = nil) {
+        toast = ReviewToast(text: text, actionTitle: title, action: perform)
+        announce(text)
+    }
+
+    // MARK: Comments that lost their lines
+
+    private func moveUnplaced(_ id: UUID, to anchor: DiffAnchor) {
+        guard let review else { return }
+        let quote = excerpt(anchor)
+        review.reviews.move(id, to: anchor, excerpt: quote.text, offsets: quote.offsets, in: review.sessionID)
+        reattaching = nil
+        focusedComment = id
+        revealSerial += 1
+        showToast("Moved to \(anchor.label.lowercased())")
+    }
+
+    private func unplacedComments(_ comments: [ReviewComment], review: ReviewTarget) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             ForEach(comments) { comment in
-                ReviewCommentCard(comment: comment, detail: comment.anchor.label) { openComment(comment) }
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.attentionText)
+                    VStack(alignment: .leading, spacing: 8) {
+                        (Text("This comment's code is no longer in the diff.").fontWeight(.semibold)
+                         + Text(" It was on \(comment.anchor.label.lowercased()). It still goes with your review."))
+                            .font(.system(size: 12))
+                            .fixedSize(horizontal: false, vertical: true)
+                        card(comment, review: review)
+                        if !comment.excerpt.isBlank {
+                            Text(comment.excerpt).font(.mono(11)).foregroundStyle(.secondary).lineLimit(3)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8).background(RoundedRectangle(cornerRadius: 6).fill(Theme.sunken))
+                        }
+                        HStack(spacing: 12) {
+                            if reattaching == comment.id {
+                                Text("Click a line number to move the comment there.")
+                                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.accent)
+                                InlineLink(title: "Cancel", tint: Color.secondary) { reattaching = nil }
+                            } else {
+                                ActionButton(title: "Move to a line", tone: .outlined, height: 26, size: 11.5,
+                                             icon: "scope") {
+                                    reattaching = comment.id
+                                    announce("Click a line number to move the comment there")
+                                }
+                                InlineLink(title: "Leave it as a file comment", tint: Color.secondary) {
+                                    review.reviews.keepOnFile(comment.id, in: review.sessionID)
+                                    showToast("It stays in the review as a comment on the whole file")
+                                }
+                                InlineLink(title: "Delete", tint: Theme.deletion) { deleteComment(comment) }
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.attention.opacity(0.08)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.attention.opacity(0.3)))
             }
         }
         .padding(.horizontal, 20).padding(.bottom, 8)
     }
 
+    private func fileComments(_ comments: [ReviewComment], review: ReviewTarget) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(comments) { comment in
+                if commentDraft?.editing == comment.id {
+                    composer(review)
+                } else {
+                    card(comment, review: review)
+                }
+            }
+        }
+        .padding(.horizontal, 20).padding(.bottom, 8)
+    }
+
+    // The first time the diff takes comments, a note says how.
+    private var coachMark: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Comment on any line").font(.system(size: 12.5, weight: .semibold))
+            Text("Click a line number to leave a note for \(review?.agent.title ?? "the agent"). Drag down the numbers to cover several lines. Everything waits here until you send it.")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                InlineLink(title: "Got it") { coachSeen = true }
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .frame(width: 300)
+        .floatingCard(cornerRadius: 10)
+        .accessibilityElement(children: .contain)
+    }
+
+    // MARK: Review bar
+
     @ViewBuilder private func reviewStrip(_ review: ReviewTarget) -> some View {
         let all = review.reviews.comments(review.sessionID)
-        let run = review.reviews.runs[review.sessionID]
-        let fileCount = Set(all.map { $0.root + "/" + $0.path }).count
+        let kept = all.filter { !$0.isPending }
+        let pending = all.count - kept.count
+        let fileCount = Set(kept.map { $0.root + "/" + $0.path }).count
         let settled = settledComments(all)
+        let unplaced = placement.unplaced.count
         HStack(spacing: 10) {
-            Image(systemName: "text.bubble.fill").font(.system(size: 12)).foregroundStyle(Theme.accent)
-            if let run {
-                ProgressView().controlSize(.mini)
-                Text("\(run.agent.title) is reading the changes for a second opinion…")
-                    .foregroundStyle(.secondary).lineLimit(1)
-                InlineLink(title: "Stop", tint: Color.secondary) { review.reviews.stopSecondOpinion(review.sessionID) }
-            } else if all.isEmpty {
-                Text(review.reviews.notes[review.sessionID] ?? "Click a line number to leave a comment for \(review.agent.title).")
-                    .foregroundStyle(.secondary).lineLimit(1)
-            } else {
-                Text("\(counted(all.count, "comment")) on \(counted(fileCount, "file"))")
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Your review", systemImage: "text.bubble.fill")
                     .font(.system(size: 12, weight: .semibold))
-                if settled > 0 {
-                    Text("\(settled) on files with no changes left")
-                        .foregroundStyle(.secondary).lineLimit(1)
-                        .appTooltip("Their file was committed or reverted. They are still in the review, and the send preview shows them.")
+                    .labelStyle(ReviewBarLabelStyle())
+                HStack(spacing: 8) {
+                    Text(!kept.isEmpty ? "\(counted(kept.count, "comment")) on \(counted(fileCount, "file"))"
+                         : all.isEmpty ? "Click a line number, or drag down several, to comment" : "Nothing kept yet")
+                        .lineLimit(1)
+                    if pending > 0 {
+                        Button(action: nextPending) {
+                            Text("\(counted(pending, "finding")) to look at")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(Theme.attentionText)
+                                .padding(.horizontal, 7).padding(.vertical, 1)
+                                .background(Capsule().fill(Theme.attention.opacity(0.14)))
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .appTooltip("Look at the next finding  ⌥↓")
+                    }
+                    if unplaced > 0 {
+                        Text("\(unplaced) not on a line").appTooltip("Its code moved or was removed")
+                    }
+                    if settled > 0 {
+                        Text("\(settled) on files with no changes left").lineLimit(1)
+                            .appTooltip("Their file was committed or reverted. They are still in the review, and the send dialog lists them.")
+                    }
                 }
-                if let note = review.reviews.notes[review.sessionID] {
-                    Text(note).foregroundStyle(.secondary).lineLimit(1)
-                }
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
-            if run == nil {
-                ActionButton(title: "Second opinion", tone: .outlined, height: 28, size: 12,
-                             icon: "person.2", disclosure: true)
-                    .appMenu { secondOpinionMenu(review) }
-                    .appTooltip("Ask another agent to review these changes and leave comments")
-                    .accessibilityLabel("Ask for a second opinion")
+            ForEach(review.reviews.runs(review.sessionID)) { run in
+                ReviewLane(run: run,
+                           stop: {
+                               review.reviews.stopSecondOpinion(review.sessionID, agent: run.agent)
+                               showToast("Stopped \(run.agent.title)'s review")
+                           },
+                           retry: { review.reviews.retrySecondOpinion(review.sessionID, agent: run.agent) },
+                           dismiss: { review.reviews.dismissLane(review.sessionID, agent: run.agent) })
             }
+            ActionButton(title: "Second opinion", tone: .outlined, height: 28, size: 12,
+                         icon: "person.2", trailingIcon: showsPicker ? "chevron.down" : "chevron.up") {
+                openPicker(review)
+            }
+            .appTooltip("Ask other agents to review these changes")
+            .accessibilityLabel("Ask for a second opinion")
+            .accessibilityValue(showsPicker ? "Open" : "Closed")
             if !all.isEmpty {
-                InlineLink(title: "Clear", tint: Color.secondary) { confirmClear(review, count: all.count) }
-                ActionButton(title: "Send to \(review.agent.title)", tone: .green, height: 28, size: 12,
-                             icon: "paperplane.fill") { previewSend(review) }
+                InlineLink(title: "Clear", tint: Color.secondary) { confirmClear(review, kept: kept.count, pending: pending) }
             }
+            ActionButton(title: "Send to \(review.agent.title)" + (kept.isEmpty ? "" : "  \(kept.count)"),
+                         tone: .green, height: 28, size: 12, icon: "paperplane.fill") { previewSend(review) }
+                .disabled(kept.isEmpty)
         }
         .font(.system(size: 12))
         .padding(.horizontal, 20).padding(.vertical, 8)
@@ -1997,76 +2410,366 @@ struct ChangesView: View {
         return comments.count { !changed.contains($0.root + "/" + $0.path) }
     }
 
-    // The session's own agent is offered too, last: a fresh run of it has none of the
-    // conversation that wrote the code, which is most of what makes a review useful.
-    private func secondOpinionMenu(_ review: ReviewTarget) -> [MenuEntry] {
-        let agents = AgentKind.allCases.filter { $0 != review.agent } + [review.agent]
-        return agents.compactMap { agent -> MenuEntry? in
-            guard let executable = review.executable(agent) else { return nil }
-            return .item("Ask \(agent.title)", icon: "person.2",
-                         subtitle: agent == review.agent ? "A fresh run, without this conversation" : agent.vendor) {
-                review.reviews.startSecondOpinion(review.sessionID, agent: agent, executable: executable,
-                                           repositories: reviewRepositories)
+    // Says once when each reviewer is done, with the way to its findings.
+    private func reportFinishedRuns(old: [SecondOpinionRun], new: [SecondOpinionRun]) {
+        for run in new where !run.isRunning {
+            guard old.first(where: { $0.agent == run.agent })?.isRunning == true else { continue }
+            switch run.state {
+            case .finished(let found) where found > 0:
+                showToast("\(run.agent.title) left \(counted(found, "finding"))", action: "Look at them") {
+                    reviewFilter = .pending
+                    nextPending()
+                }
+            case .finished:
+                showToast("\(run.agent.title) found nothing worth raising")
+            case .failed:
+                showToast("\(run.agent.title) could not finish the review", action: "Try again") {
+                    review?.reviews.retrySecondOpinion(review?.sessionID ?? UUID(), agent: run.agent)
+                }
+            case .running:
+                break
             }
         }
     }
 
-    // The open project leads, so the reviewer starts in the folder the session works in.
-    private var reviewRepositories: [(root: String, name: String)] {
-        let open = repositories.filter { $0.root == root } + repositories.filter { $0.root != root }
-        return open.map { (root: $0.root, name: $0.name) }
+    // MARK: Second opinion
+
+    private func openPicker(_ review: ReviewTarget) {
+        if showsPicker {
+            showsPicker = false
+            return
+        }
+        let installed = AgentKind.allCases.filter { review.executable($0) != nil }
+        if pickerReviewers.isEmpty {
+            // Another agent than the session's own is the useful default.
+            pickerReviewers = Set(installed.filter { $0 != review.agent }.prefix(1))
+        }
+        if pickerScope == .sinceReview, review.reviews.latestTrees(review.sessionID) == nil { pickerScope = .all }
+        if pickerScope == .file, selected == nil { pickerScope = .all }
+        showsPicker = true
     }
 
-    private func confirmClear(_ review: ReviewTarget, count: Int) {
+    private func secondOpinionPicker(_ review: ReviewTarget) -> some View {
+        let installed = AgentKind.allCases.filter { review.executable($0) != nil }
+        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
+        let changed = repositories.reduce(0) { total, repository in
+            total + ((repository.root == root ? snapshot : gitStats.snapshot(at: repository.root))?.files.count ?? 0)
+        }
+        return SecondOpinionPicker(
+            sessionAgent: review.agent, installed: installed, running: running,
+            reviewers: $pickerReviewers,
+            focus: Binding(get: { navigation.secondOpinionFocus }, set: { navigation.secondOpinionFocus = $0 }),
+            scope: $pickerScope,
+            fileCount: changed, fileName: selected?.fileName,
+            canReadSince: review.reviews.latestTrees(review.sessionID) != nil,
+            ask: { askForSecondOpinion(review, running: running) },
+            cancel: { showsPicker = false })
+    }
+
+    private func askForSecondOpinion(_ review: ReviewTarget, running: Set<AgentKind>) {
+        let scope: SecondOpinionRequest.Scope
+        switch pickerScope {
+        case .all: scope = .all
+        case .file: scope = selected.map { .file(root: repoRoot, path: $0.path) } ?? .all
+        case .sinceReview: scope = review.reviews.latestTrees(review.sessionID).map { .sinceReview(trees: $0) } ?? .all
+        }
+        let chosen = AgentKind.allCases.filter { pickerReviewers.contains($0) && !running.contains($0) }
+        startSecondOpinion(review, agents: chosen, scope: scope)
+        showsPicker = false
+    }
+
+    private func startSecondOpinion(_ review: ReviewTarget, agents: [AgentKind], scope: SecondOpinionRequest.Scope) {
+        var asked: [AgentKind] = []
+        for agent in agents {
+            guard let executable = review.executable(agent) else { continue }
+            review.reviews.startSecondOpinion(review.sessionID, agent: agent, request: SecondOpinionRequest(
+                focus: SecondOpinion.Focus.allCases.filter(navigation.secondOpinionFocus.contains),
+                scope: scope, repositories: reviewRepositories, executable: executable))
+            asked.append(agent)
+        }
+        guard !asked.isEmpty else { return }
+        showingReview = true
+        announce("Asked \(asked.map(\.title).joined(separator: " and ")) for a second opinion")
+    }
+
+    // The open project leads, so the reviewer starts in the folder the session works in.
+    private var reviewRepositories: [ReviewRepository] {
+        let open = repositories.filter { $0.root == root } + repositories.filter { $0.root != root }
+        return open.map { ReviewRepository(root: $0.root, name: $0.name) }
+    }
+
+    // MARK: Clearing and sending
+
+    private func confirmClear(_ review: ReviewTarget, kept: Int, pending: Int) {
+        let what = counted(kept, "comment") + (pending > 0 ? " and \(counted(pending, "finding"))" : "")
         dialogs.show(.impact(
             "Clear the review?",
             rows: [
-                .init(title: counted(count, "comment"), detail: "Every unsent comment on these changes"),
+                .init(title: what, detail: "Everything not yet sent"),
                 .init(title: "The changes themselves", detail: "Nothing in the files is touched", kept: true)
             ],
             warning: "Comments that have not been sent cannot be brought back.",
             compact: true,
-            action: "Clear comments") {
+            action: "Clear review") {
                 review.reviews.clear(review.sessionID)
                 commentDraft = nil
+                focusedComment = nil
+                showToast("Review cleared")
             })
     }
 
+    private var projectNames: [String: String] {
+        Dictionary(repositories.map { ($0.root, $0.name) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func fileLabel(_ comment: ReviewComment) -> String {
+        let name = (comment.path as NSString).lastPathComponent
+        guard repositories.count > 1 else { return name }
+        return (projectNames[comment.root] ?? (comment.root as NSString).lastPathComponent) + " · " + name
+    }
+
     private func previewSend(_ review: ReviewTarget) {
-        let comments = review.reviews.comments(review.sessionID)
-        guard !comments.isEmpty else { return }
-        let names = Dictionary(repositories.map { ($0.root, $0.name) }, uniquingKeysWith: { first, _ in first })
-        let prompt = ReviewPrompt.feedback(comments, projectNames: names)
+        let kept = ReviewOrder.sorted(review.reviews.kept(review.sessionID), roots: repositories.map(\.root))
+        guard !kept.isEmpty else { return }
+        let names = projectNames
         let busy = review.isBusy()
         dialogs.show(Dialog(
-            title: "Send \(counted(comments.count, "comment")) to \(review.agent.title)?",
-            message: busy
-                ? "They go to the session as one prompt, which runs once the current turn ends."
-                : "They go to the session as one prompt.",
-            content: AnyView(
-                ScrollView {
-                    Text(prompt)
-                        .font(.mono(11))
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                }
-                .frame(maxHeight: 320)
-                .background(Theme.field, in: RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))),
-            actions: [
-                .init(label: "Send", kind: .primary) {
-                    review.send(prompt)
-                    // Only what the preview showed went, so a second opinion that finished
-                    // while it was open keeps its findings for the next review.
-                    review.reviews.remove(Set(comments.map(\.id)), from: review.sessionID)
-                    commentDraft = nil
-                    review.sent()
+            title: "Send your review to \(review.agent.title)",
+            message: "It goes to the session as one message. Anything you untick stays in the review for later.",
+            content: AnyView(SendReviewSheet(
+                agentTitle: review.agent.title, comments: kept,
+                pendingCount: review.reviews.pending(review.sessionID).count, busy: busy,
+                fileName: fileLabel,
+                prompt: { ReviewPrompt.feedback($0, projectNames: names, note: $1) },
+                lookFirst: {
+                    reviewFilter = .pending
+                    nextPending()
                 },
-                .init(label: "Cancel", kind: .cancel)
-            ],
-            width: 600))
+                send: { sendReview(review, comments: $0, note: $1) })),
+            actions: [],
+            width: 620))
+    }
+
+    // Each review goes as a round of its own, so Chat can show it as one card and say
+    // afterwards what came of each comment. Comments left unticked stay for the next.
+    private func sendReview(_ review: ReviewTarget, comments: [ReviewComment], note: String) {
+        guard !comments.isEmpty else { return }
+        let prompt = ReviewPrompt.feedback(comments, projectNames: projectNames, note: note)
+        let busy = review.isBusy()
+        review.reviews.recordRound(comments, prompt: prompt, note: note,
+                                   roots: repositories.map(\.root), in: review.sessionID)
+        review.send(prompt)
+        if let editing = commentDraft?.editing, comments.contains(where: { $0.id == editing }) { commentDraft = nil }
+        focusedComment = nil
+        showToast(busy ? "\(counted(comments.count, "comment")) queued for \(review.agent.title)"
+                       : "Sent \(counted(comments.count, "comment")) to \(review.agent.title)",
+                  action: "Open Chat", perform: review.openChat)
+    }
+
+    // MARK: Review list
+
+    @ViewBuilder private func reviewNavigator(_ review: ReviewTarget) -> some View {
+        let all = orderedComments
+        let pending = all.filter(\.isPending)
+        let runs = review.reviews.runs(review.sessionID)
+        let running = runs.filter(\.isRunning)
+        let emptyRun = runs.first { if case .finished(0) = $0.state { true } else { false } }
+        let list = all.filter(reviewFilter.admits)
+        VStack(alignment: .leading, spacing: 8) {
+            FlowRow(spacing: 4) {
+                filterPill("All", .all, count: all.count)
+                filterPill("To look at", .pending, count: pending.count)
+                filterPill("Yours", .yours, count: all.count { $0.reviewer == nil })
+                filterPill("Reviewers", .reviewers, count: all.count { $0.reviewer != nil })
+            }
+            .padding(.horizontal, 12).padding(.top, 10)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        if !running.isEmpty {
+                            summaryCard {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.mini)
+                                    Text("\(running.map(\.agent.title).joined(separator: " and ")) \(running.count > 1 ? "are" : "is") reading the changes")
+                                        .font(.system(size: 12.5, weight: .semibold))
+                                }
+                                Text("Findings land here as each reviewer finishes. You can keep commenting while they work.")
+                                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        } else if let emptyRun {
+                            summaryCard {
+                                Label("\(emptyRun.agent.title) found nothing worth raising", systemImage: "checkmark")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                Text("Your own comments are below.")
+                                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                                ActionButton(title: "Ask another reviewer", tone: .outlined, height: 26, size: 11.5,
+                                             icon: "person.2") { openPicker(review) }
+                            }
+                        }
+                        if !pending.isEmpty { findingsSummary(pending, review: review) }
+                        if list.isEmpty && running.isEmpty && emptyRun == nil {
+                            VStack(spacing: 6) {
+                                if reviewFilter == .pending {
+                                    Image(systemName: "checkmark").foregroundStyle(Theme.dotOn)
+                                    Text("Nothing left to look at").font(.system(size: 12.5, weight: .semibold))
+                                    Text("Every finding has been kept or dismissed. Send the review when you are ready.")
+                                } else {
+                                    Text("No comments yet").font(.system(size: 12.5, weight: .semibold))
+                                    Text("Click a line number in the diff to comment on it, or ask another agent for a second opinion.")
+                                }
+                            }
+                            .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity).padding(.vertical, 24).padding(.horizontal, 12)
+                        }
+                        ForEach(Array(list.enumerated()), id: \.element.id) { index, comment in
+                            if index == 0 || ReviewRound.fileKey(root: list[index - 1].root, path: list[index - 1].path)
+                                != ReviewRound.fileKey(root: comment.root, path: comment.path) {
+                                HStack(spacing: 6) {
+                                    Text(fileLabel(comment)).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                                    Spacer(minLength: 0)
+                                    Text("\(all.count { $0.root == comment.root && $0.path == comment.path })")
+                                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                                }
+                                .padding(.horizontal, 6).padding(.top, index == 0 ? 2 : 8)
+                            }
+                            reviewItem(comment)
+                                .id(comment.id)
+                        }
+                    }
+                    .padding(10)
+                }
+                .onChange(of: focusedComment) { _, id in
+                    if let id { proxy.scrollTo(id) }
+                }
+            }
+        }
+    }
+
+    private func filterPill(_ title: String, _ filter: ReviewFilter, count: Int) -> some View {
+        ChoicePill(title: "\(title) \(count)", selected: reviewFilter == filter) { reviewFilter = filter }
+    }
+
+    private func summaryCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8, content: content)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.field))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
+    }
+
+    private func findingsSummary(_ pending: [ReviewComment], review: ReviewTarget) -> some View {
+        let counts = ReviewComment.Severity.allCases.map { severity in
+            (severity, pending.count { $0.severity == severity })
+        }
+        let both = pending.count { !$0.also.isEmpty }
+        let who = Array(NSOrderedSet(array: pending.flatMap(\.reviewers).map(\.title))) as? [String] ?? []
+        return summaryCard {
+            Text("\(counted(pending.count, "finding")) from \(who.joined(separator: " and "))")
+                .font(.system(size: 12.5, weight: .semibold))
+            GeometryReader { geometry in
+                HStack(spacing: 2) {
+                    ForEach(counts.filter { $0.1 > 0 }, id: \.0) { severity, count in
+                        RoundedRectangle(cornerRadius: 2).fill(severityColour(severity))
+                            .frame(width: max(4, (geometry.size.width - 4) * CGFloat(count) / CGFloat(max(1, pending.count))))
+                    }
+                }
+            }
+            .frame(height: 5)
+            .accessibilityHidden(true)
+            FlowRow(spacing: 10) {
+                ForEach(counts.filter { $0.1 > 0 }, id: \.0) { severity, count in
+                    HStack(spacing: 4) {
+                        Circle().fill(severityColour(severity)).frame(width: 6, height: 6)
+                        Text("\(count) \(severity.label.lowercased())")
+                    }
+                }
+                if both > 0 { Label("\(both) raised by both", systemImage: "person.2") }
+            }
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("Nothing goes to \(review.agent.title) until you keep it. Keep the ones you agree with, and dismiss the rest.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                ActionButton(title: "Look at the first", tone: .green, height: 26, size: 11.5, action: nextPending)
+                    .appTooltip("Next finding  ⌥↓")
+                Spacer(minLength: 0)
+                InlineLink(title: "Keep all", size: 11.5, tint: Color.secondary) {
+                    review.reviews.keepAll(review.sessionID)
+                    focusedComment = nil
+                    showToast("Kept every finding. \(counted(review.reviews.kept(review.sessionID).count, "comment")) ready to send.")
+                }
+                InlineLink(title: "Dismiss all", size: 11.5, tint: Color.secondary) {
+                    let gone = review.reviews.dismissAllPending(review.sessionID)
+                    focusedComment = nil
+                    let reviews = review.reviews
+                    let sessionID = review.sessionID
+                    showToast("Dismissed \(counted(gone.count, "finding"))", action: "Undo") {
+                        for comment in gone { reviews.restore(comment, to: sessionID) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func severityColour(_ severity: ReviewComment.Severity) -> Color {
+        switch severity {
+        case .must: Theme.deletion
+        case .should: Theme.attention
+        case .look: Color.secondary.opacity(0.5)
+        }
+    }
+
+    private func reviewItem(_ comment: ReviewComment) -> some View {
+        let isFocused = focusedComment == comment.id
+        return Button { focus(comment) } label: {
+            HStack(alignment: .top, spacing: 8) {
+                ReviewAvatars(comment: comment, size: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Text(comment.authorName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                        Text(comment.onFile ? "file" : comment.lastLine.map { "\(comment.line)–\($0)" } ?? "\(comment.line)")
+                            .font(.mono(10.5)).foregroundStyle(.secondary)
+                        if comment.kind == .question { QuestionTag() }
+                        if let severity = comment.severity { SeverityChip(severity: severity) }
+                    }
+                    ReviewText(text: comment.body, size: 11.5, lineLimit: 2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isFocused ? Theme.accent.opacity(0.08) : .clear))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(comment.isPending ? Theme.attention.opacity(0.6) : isFocused ? Theme.accent.opacity(0.3) : .clear,
+                                  style: StrokeStyle(lineWidth: 1, dash: comment.isPending ? [4, 3] : []))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .hoverFill(cornerRadius: 8)
+        .accessibilityLabel(comment.spokenName + ". " + comment.body)
+        .accessibilityAddTraits(isFocused ? .isSelected : [])
+    }
+
+    // Where the focused comment stands in the whole review, with the way to the next.
+    private var commentNavigation: some View {
+        let list = orderedComments
+        let index = list.firstIndex { $0.id == focusedComment }
+        let here = openFileComments.count
+        return HStack(spacing: 4) {
+            Text(index.map { "Comment \($0 + 1) of \(list.count)" }
+                 ?? counted(list.count, "comment") + (here > 0 ? ", \(here) here" : ""))
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            GlyphButton(icon: "chevron.up", side: 24) { step(-1) }
+                .appTooltip("Previous comment  ⌥↑")
+                .accessibilityLabel("Previous comment")
+            GlyphButton(icon: "chevron.down", side: 24) { step(1) }
+                .appTooltip("Next comment  ⌥↓")
+                .accessibilityLabel("Next comment")
+        }
     }
 
     private func fileURL(_ file: GitChange) -> URL {
@@ -2080,6 +2783,16 @@ struct ChangesView: View {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } else {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
+        }
+    }
+}
+
+// The review bar's title: its icon in the accent, its words in the ink.
+private struct ReviewBarLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.icon.foregroundStyle(Theme.accent)
+            configuration.title
         }
     }
 }
