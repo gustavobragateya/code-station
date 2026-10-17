@@ -2799,6 +2799,18 @@ struct ChangesView: View {
                   action: "Open Chat", perform: review.openChat)
     }
 
+    // A change made from an answer goes on its own, at once, as a round of its own. The
+    // rest of the review stays where it is.
+    private func sendChange(_ change: ReviewComment, review: ReviewTarget) {
+        let prompt = ReviewPrompt.feedback([change], projectNames: projectNames, note: "")
+        let busy = review.isBusy()
+        review.reviews.recordRound([change], prompt: prompt, note: "",
+                                   roots: repositories.map(\.root), in: review.sessionID)
+        review.send(prompt)
+        showToast(busy ? "Change queued for \(review.agent.title)" : "Sent the change to \(review.agent.title)",
+                  action: "Open Chat", perform: review.openChat)
+    }
+
     // MARK: Questions
 
     private func questionContext(_ review: ReviewTarget) -> QuestionContext {
@@ -2840,8 +2852,8 @@ struct ChangesView: View {
                 announce("Question deleted")
             },
             makeChange: question.isWhole ? nil : {
-                reviews.makeChange(from: question.id, in: sessionID)
-                showToast("Added a change to your review. It goes to \(review.agent.title) when you send.")
+                guard let change = reviews.makeChange(from: question.id, in: sessionID) else { return }
+                sendChange(change, review: review)
             },
             takeOut: {
                 reviews.takeOutOfReview(question.id, in: sessionID)

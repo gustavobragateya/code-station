@@ -93,7 +93,7 @@ struct ReviewQuestionTests {
         #expect(store.question(question.id, in: session)?.failure == "Claude Code is not installed.")
     }
 
-    @Test func aSuggestionBecomesAChangeThatCarriesTheQuestionOnlyWhenTicked() async throws {
+    @Test func aSuggestionBecomesAChangeThatCarriesTheQuestion() async throws {
         let store = store(replies: [.success(.init(answer: "It is a sample.", suggestion: "Say it is a sample.",
                                                    forkID: nil))])
         let session = UUID()
@@ -104,13 +104,12 @@ struct ReviewQuestionTests {
         let change = try #require(store.makeChange(from: question.id, in: session))
         #expect(change.body == "Say it is a sample.")
         #expect(change.kind == .change)
-        #expect(change.why == nil)
         #expect(store.kept(session).map(\.id) == [change.id])
-        #expect(!ReviewPrompt.feedback(store.kept(session)).contains("Why:"))
-
-        store.setSendsQuestion(true, change: change.id, in: session)
         let prompt = ReviewPrompt.feedback(store.kept(session))
         #expect(prompt.contains("Say it is a sample.\n\nWhy: I asked \"What is this?\" and the answer was: It is a sample."))
+
+        store.setSendsQuestion(false, change: change.id, in: session)
+        #expect(!ReviewPrompt.feedback(store.kept(session)).contains("Why:"))
 
         store.takeOutOfReview(question.id, in: session)
         #expect(store.comments(session).isEmpty)

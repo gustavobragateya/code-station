@@ -1253,9 +1253,8 @@ final class ReviewCommentStore {
         saver?.schedule()
     }
 
-    // The answer's suggestion becomes a change in the review, on the question's lines. It
-    // goes to the agent only with the review, and on its own words unless the person ticks
-    // to send the question and answer along.
+    // The answer's suggestion becomes a change on the question's lines. The question and
+    // answer go along, so the agent knows why it is asked to make it.
     @discardableResult
     func makeChange(from id: UUID, in sessionID: UUID) -> ReviewComment? {
         guard let index = questionIndex(id, in: sessionID), let question = questions[sessionID]?[index],
@@ -1265,6 +1264,7 @@ final class ReviewCommentStore {
                                    excerpt: question.excerpt, body: suggestion,
                                    excerptOffsets: question.excerptOffsets)
         change.questionID = id
+        change.why = question.why
         add(change, to: sessionID)
         questions[sessionID]?[index].changeID = change.id
         return change

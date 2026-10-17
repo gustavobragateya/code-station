@@ -612,7 +612,7 @@ struct QuestionThreadView: View {
                             HStack(spacing: 10) {
                                 ActionButton(title: "Make this a change", tone: .green, height: 26, size: 11.5,
                                              icon: "pencil", action: makeChange)
-                                Text("Goes to \(agent.title) only when you send your review")
+                                Text("Goes to \(agent.title) straight away")
                                     .font(.system(size: 11)).foregroundStyle(.tertiary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
