@@ -67,7 +67,7 @@ private struct SidebarHeaderProbe: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SidebarBrandBar(runningCount: running, isHome: false, selectHome: {}, noticeMenu: { [] })
+            SidebarBrandBar(runningCount: running, isHome: false, selectHome: {})
             SidebarFilterBar(box: $box, focused: $focused,
                              openCommandPalette: {}, showsShortcutHint: true)
             SidebarArrangementBar(sort: .constant(alphabetical ? .name : .lastUsed),

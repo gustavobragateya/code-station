@@ -141,8 +141,7 @@ struct AppSidebar: View {
         return VStack(alignment: .leading, spacing: 0) {
             SidebarBrandBar(runningCount: notices.count { $0.notice == .running },
                             isHome: store.selection == .home,
-                            selectHome: store.selectHome,
-                            noticeMenu: { sessionNoticeMenu })
+                            selectHome: store.selectHome)
             if !waiting.isEmpty {
                 SidebarNeedsYouStack(waiting: waiting, open: openNoticedSession)
                     .transition(.opacity)
@@ -158,11 +157,6 @@ struct AppSidebar: View {
 
     private var sessionNotices: [NoticedSession] {
         SidebarNotices.all(store: store, runner: runner)
-    }
-
-    private var sessionNoticeMenu: [MenuEntry] {
-        SidebarNotices.menu(sessionNotices, store: store,
-                            isSelected: isSelected, open: openNoticedSession)
     }
 
     private func openNoticedSession(_ session: ChatSession) {
