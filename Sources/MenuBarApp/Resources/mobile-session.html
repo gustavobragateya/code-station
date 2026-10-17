@@ -868,6 +868,12 @@
       let socket;
       let authenticated = false;
       let pairingEnded = false;
+      // When a code expires with no other code out, the Mac stops listening, so no
+      // message can come back to say the pairing ended. After this many attempts that
+      // never reach the Mac, the page says a fresh code is likely needed, but it keeps
+      // trying in case the Mac was only asleep.
+      const unreachableAfter = 20;
+      let failedAttempts = 0;
       let activeSessionID;
       const drafts = new Map();
       let conversation = 'main';
@@ -950,16 +956,20 @@
 
       const setConnected = live => {
         authenticated = live;
+        const unreachable = !pairingEnded && failedAttempts >= unreachableAfter;
         if (live) { clearTimeout(toastTimer); toast.classList.remove('visible'); }
         document.querySelectorAll('.connection-label').forEach(node => {
           node.textContent = live ? 'Connected to Mac' : pairingEnded ? 'Pairing ended' : 'Disconnected';
         });
         for (const dot of [light, listLight]) dot.className = live ? 'light live' : 'light';
         find('offline').hidden = live;
-        find('offline-title').textContent = pairingEnded ? 'Scan a fresh QR code' : 'Connection interrupted';
+        find('offline-title').textContent = pairingEnded ? 'Scan a fresh QR code'
+          : unreachable ? "Can't reach your Mac" : 'Connection interrupted';
         find('offline-detail').textContent = pairingEnded
           ? 'This pairing is no longer available. Open phone sharing on your Mac and scan a fresh code. Your draft is kept here.'
-          : 'Your sessions and draft are still here. Keep your Mac awake and both devices on the same Wi-Fi.';
+          : unreachable
+            ? 'A code expires 10 minutes after the phone drops. If it has been longer, open phone sharing on your Mac and scan a fresh code. Your draft is kept here.'
+            : 'Your sessions and draft are still here. Keep your Mac awake and both devices on the same Wi-Fi.';
         find('retry').hidden = pairingEnded;
         sendButton.disabled = !live;
         stop.disabled = !live;
@@ -1908,7 +1918,10 @@
         const connection = new WebSocket(`${scheme}://${location.host}/socket/${pairingID}`);
         socket = connection;
         authenticationTimer = setTimeout(() => connection.close(), 10000);
+        let reached = false;
         connection.addEventListener('open', () => {
+          reached = true;
+          failedAttempts = 0;
           connection.send(JSON.stringify({ type: 'authenticate', version: 1, secret }));
         });
         connection.addEventListener('message', event => {
@@ -1939,6 +1952,7 @@
         connection.addEventListener('close', () => {
           if (socket !== connection) return;
           clearTimeout(authenticationTimer);
+          if (!reached) failedAttempts += 1;
           setConnected(false);
           if (!pairingEnded) reconnectTimer = setTimeout(connect, 1500);
         });
