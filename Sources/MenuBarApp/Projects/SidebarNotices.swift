@@ -56,9 +56,10 @@ enum SidebarNotices {
 
 // MARK: - The rail's header
 
-// The app's own row: home, the one number worth carrying at the very top, and the phone
-// badge. The running count is the reason to look at the rail at all, so it sits here
-// rather than being found by opening the project it belongs to.
+// The app's own row: home and the few numbers worth carrying at the very top. The running
+// count is the reason to look at the rail at all, so it sits here rather than being found
+// by opening the project it belongs to. Phone sharing reads as a second status line in the
+// same box; stopping a share belongs to the pairing dialog, not to the rail.
 struct SidebarBrandBar: View {
     let runningCount: Int
     let isHome: Bool
@@ -68,30 +69,21 @@ struct SidebarBrandBar: View {
     @Environment(MobileAccessController.self) private var mobileAccess
     @State private var hovering = false
 
-    var body: some View {
-        HStack(spacing: 0) {
-            homeButton
-            if !mobileAccess.activeShares.isEmpty {
-                MobileAccessBadge()
-                    .fixedSize()
-                    .padding(.trailing, 14)
-            }
-        }
-    }
+    private var phone: SidebarPhoneStatus? { SidebarPhoneStatus(mobileAccess.activeShares) }
 
-    private var homeButton: some View {
+    var body: some View {
         Button(action: selectHome) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
                     brand
                     Spacer(minLength: 0)
-                    runningLabel
+                    statusLines
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     brand
                     HStack {
                         Spacer(minLength: 0)
-                        runningLabel
+                        statusLines
                     }
                 }
             }
@@ -106,9 +98,15 @@ struct SidebarBrandBar: View {
         .onHover { hovering = $0 }
         .sidebarFocusRing()
         .accessibilityLabel("Teya Code Station home")
-        .accessibilityValue(runningCount > 0 ? "\(runningCount) running sessions" : "")
+        .accessibilityValue(Self.accessibilityValue(runningCount: runningCount, phone: phone))
         .accessibilityAddTraits(isHome ? .isSelected : [])
         .appTooltip("Home")
+    }
+
+    static func accessibilityValue(runningCount: Int, phone: SidebarPhoneStatus?) -> String {
+        [runningCount > 0 ? "\(runningCount) running sessions" : nil, phone?.spoken]
+            .compactMap { $0 }
+            .joined(separator: ", ")
     }
 
     private var brand: some View {
@@ -129,16 +127,59 @@ struct SidebarBrandBar: View {
         .fixedSize()
     }
 
-    @ViewBuilder private var runningLabel: some View {
-        if runningCount > 0 {
-            HStack(spacing: 5) {
-                RunningDot(size: 5)
-                Text("\(runningCount) running")
-                    .font(.system(size: 9.5, weight: .semibold))
+    @ViewBuilder private var statusLines: some View {
+        if runningCount > 0 || phone != nil {
+            VStack(alignment: .trailing, spacing: 4) {
+                if runningCount > 0 {
+                    HStack(spacing: 5) {
+                        RunningDot(size: 5)
+                        Text("\(runningCount) running")
+                    }
+                    .foregroundStyle(Theme.accent)
+                }
+                if let phone {
+                    HStack(spacing: 5) {
+                        Image(systemName: phone.isConnected
+                                ? "iphone.radiowaves.left.and.right" : "iphone")
+                        Text(phone.text)
+                    }
+                    .foregroundStyle(phone.isConnected ? Theme.addition : Theme.accent)
+                }
             }
-            .foregroundStyle(Theme.accent)
+            .font(.system(size: 9.5, weight: .semibold))
             .fixedSize()
         }
+    }
+}
+
+// What the brand bar says about the codes that are out. A share counts as on the phone
+// once a phone has joined it; until then it is only shared.
+struct SidebarPhoneStatus: Equatable {
+    let shared: Int
+    let connected: Int
+
+    init?(_ shares: [MobileShareSummary]) {
+        self.init(shared: shares.count, connected: shares.count(where: \.isConnected))
+    }
+
+    init?(shared: Int, connected: Int) {
+        guard shared > 0 else { return nil }
+        self.shared = shared
+        self.connected = connected
+    }
+
+    var isConnected: Bool { connected > 0 }
+
+    var text: String {
+        guard isConnected else { return "\(shared) shared" }
+        return connected == shared ? "\(connected) on phone" : "\(connected) of \(shared) on phone"
+    }
+
+    var spoken: String {
+        guard isConnected else { return "\(shared) shared with a phone, none connected" }
+        return connected == shared
+            ? "\(connected) shared with a connected phone"
+            : "\(connected) of \(shared) shared with a connected phone"
     }
 }
 

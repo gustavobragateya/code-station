@@ -194,59 +194,6 @@ private struct PhoneCapsule: View {
     }
 }
 
-// Every code that is out, wherever it was made. The three buttons that hand out access sit
-// on the session, the project and Home, so without this there is no one place that says
-// what a phone can reach or takes it back.
-struct MobileAccessBadge: View {
-    @Environment(MobileAccessController.self) private var mobileAccess
-
-    var body: some View {
-        let shares = mobileAccess.activeShares
-        if !shares.isEmpty {
-            let connected = shares.count(where: \.isConnected)
-            let tint = connected > 0 ? Theme.addition : Theme.accent
-            HStack(spacing: 5) {
-                Image(systemName: connected > 0
-                        ? "iphone.radiowaves.left.and.right" : "iphone")
-                    .font(.system(size: 10, weight: .semibold))
-                Text("\(shares.count)")
-                    .font(.mono(9.5, .semibold))
-                    .kerning(0.7)
-            }
-            .foregroundStyle(tint)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(0.1)))
-            .appMenu { menu(shares) }
-            .appTooltip(connected > 0
-                        ? "\(connected) of \(shares.count) shared with a connected phone"
-                        : "Shared with a phone")
-            .accessibilityLabel("Mobile access")
-        }
-    }
-
-    private func menu(_ shares: [MobileShareSummary]) -> [MenuEntry] {
-        var entries: [MenuEntry] = shares.map { share in
-            .item(share.name,
-                  icon: share.isConnected
-                      ? "iphone.radiowaves.left.and.right" : "iphone",
-                  subtitle: "\(share.state) · \(share.reach)",
-                  detail: "Revoke",
-                  detailColour: Theme.deletion,
-                  detailAction: {
-                      mobileAccess.revoke(share.scope)
-                  })
-        }
-        if shares.count > 1 {
-            entries.append(.separator)
-            entries.append(.item("Revoke all", kind: .destructive, icon: "xmark.circle") {
-                mobileAccess.stop()
-            })
-        }
-        return entries
-    }
-}
-
 struct MobilePairingView: View {
     private enum ContentState: Equatable {
         case idle(hasFailure: Bool)
