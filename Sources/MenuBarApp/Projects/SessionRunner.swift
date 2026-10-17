@@ -107,6 +107,8 @@ final class SessionRunner {
     }
 
     let composer = SessionComposerStore()
+    // Comments left on each session's changes, waiting to be sent back to its agent.
+    let reviews: ReviewCommentStore
 
     // How wide the canvas is showing the design, in CSS pixels. The agent writes HTML it
     // never sees rendered, so without this it designs for a window it imagined and the
@@ -198,6 +200,9 @@ final class SessionRunner {
          }) {
         self.configs = configs
         self.persistentAgentSessions = persistentAgentSessions
+        // A runner that keeps nothing between launches, as tests make, keeps no review either.
+        reviews = ReviewCommentStore(url: persistentAgentSessions
+            ? AppPaths.supportFile("review-comments.json") : nil)
         self.discoveredModels = discoveredModels
         self.stalledAfter = stalledAfter
         self.stallCheckInterval = stallCheckInterval
@@ -1149,6 +1154,10 @@ final class SessionRunner {
     // interrupting for. It is the same point at which the meter turns red.
     static let nearlyFullContext = 0.85
 
+    // Where an agent's CLI was found, for the runs that ask one something outside any
+    // session, such as a second opinion on a review. Nil when it is not installed.
+    func executable(for agent: AgentKind) -> String? { paths[agent] }
+
     func isNudgeDismissed(_ sessionID: UUID) -> Bool {
         records[sessionID]?.nudgeDismissed ?? false
     }
@@ -1406,6 +1415,7 @@ final class SessionRunner {
         codexContextRefreshes.removeValue(forKey: sessionID)?.task.cancel()
         records[sessionID] = nil
         composer.remove(sessionID)
+        reviews.remove(sessionID)
         canvasWidths[sessionID] = nil
     }
 

@@ -213,5 +213,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dispatch.save()
         dispatchAuth.save()
         store.flushPendingSave()
+        runner.reviews.flush()
     }
 }

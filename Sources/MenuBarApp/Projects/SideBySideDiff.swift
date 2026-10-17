@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct DiffComparisonRow: Identifiable {
@@ -56,6 +57,12 @@ struct DiffComparisonRow: Identifiable {
 struct SideBySideDiff: View {
     let lines: [DiffLine]
     let expand: (String, DiffExpandDirection) -> Void
+    // Review comments, already placed under their lines. A diff with nowhere to send
+    // comments leaves the line handler out, and its numbers are plain text.
+    var comments = ReviewPlacement()
+    var picked: Set<String> = []
+    var onLine: ((DiffAnchor, Bool) -> Void)?
+    var onComment: ((ReviewComment) -> Void)?
 
     var body: some View {
         GeometryReader { geometry in
@@ -76,8 +83,14 @@ struct SideBySideDiff: View {
                                 .background(Theme.field)
                         } else {
                             HStack(alignment: .top, spacing: 0) {
-                                cell(row.left, number: row.oldNumber)
-                                cell(row.right, number: row.newNumber)
+                                cell(row.left, number: row.oldNumber,
+                                     anchor: anchor(row.left, side: .old, number: row.oldNumber))
+                                cell(row.right, number: row.newNumber,
+                                     anchor: anchor(row.right, side: .new, number: row.newNumber))
+                            }
+                            ForEach(rowComments(row)) { comment in
+                                ReviewCommentCard(comment: comment) { onComment?(comment) }
+                                    .padding(.leading, 54).padding(.trailing, 12).padding(.vertical, 4)
                             }
                         }
                     }
@@ -87,9 +100,45 @@ struct SideBySideDiff: View {
         }
     }
 
-    private func cell(_ line: DiffLine?, number: Int?) -> some View {
+    // A context line is numbered on both sides but commented on in the new version, so
+    // its left number is not a place to start one.
+    private func anchor(_ line: DiffLine?, side: ReviewSide, number: Int?) -> DiffAnchor? {
+        guard onLine != nil, let line, let number else { return nil }
+        switch line.kind {
+        case .addition where side == .new, .context where side == .new: return DiffAnchor(side: .new, line: number)
+        case .deletion where side == .old: return DiffAnchor(side: .old, line: number)
+        default: return nil
+        }
+    }
+
+    private func rowComments(_ row: DiffComparisonRow) -> [ReviewComment] {
+        var ids = [row.left?.id, row.right?.id].compactMap { $0 }
+        if ids.count == 2 && ids[0] == ids[1] { ids.removeLast() }
+        return ids.flatMap { comments.below[$0] ?? [] }
+    }
+
+    @ViewBuilder private func number(_ number: Int?, anchor: DiffAnchor?) -> some View {
+        let label = Text(number.map(String.init) ?? "").foregroundStyle(.secondary)
+            .frame(width: 36, alignment: .trailing)
+        if let anchor, let onLine {
+            Button {
+                let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+                onLine(anchor, shift)
+            } label: {
+                label.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .hoverFill(cornerRadius: 4)
+            .appTooltip("Comment on this line. Shift-click to comment on a range.")
+            .accessibilityLabel("Comment on \(anchor.label.lowercased())")
+        } else {
+            label
+        }
+    }
+
+    private func cell(_ line: DiffLine?, number: Int?, anchor: DiffAnchor? = nil) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Text(number.map(String.init) ?? "").foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+            self.number(number, anchor: anchor)
             Text(line.map { String($0.text.prefix(1)) } ?? "").frame(width: 10)
             Text(line.map { String($0.text.dropFirst()) } ?? " ")
                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
@@ -111,7 +160,52 @@ struct SideBySideDiff: View {
         }
         .background(line?.kind == .addition ? Theme.addition.opacity(0.12) :
                     line?.kind == .deletion ? Theme.deletion.opacity(0.12) : line == nil ? Theme.field : .clear)
+        .background(anchor.map { !picked.isDisjoint(with: DiffComments.keys($0)) } == true
+                    ? Theme.accent.opacity(0.16) : .clear)
         .overlay(alignment: .trailing) { Rectangle().fill(Theme.border).frame(width: 1) }
         .accessibilityLabel(line == nil ? "No corresponding line" : line!.text)
+    }
+}
+
+// A review comment drawn as a card: who left it and what it says. Pressing it opens the
+// comment to edit or delete.
+struct ReviewCommentCard: View {
+    let comment: ReviewComment
+    var detail: String?
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: comment.author == .you ? "text.bubble" : "person.2")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.top, 2)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(comment.authorName).font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                        if let detail {
+                            Text(detail).font(.mono(10.5)).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Text(comment.body)
+                        .font(.system(size: 12.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2).fill(Theme.accent).frame(width: 3).padding(.vertical, 6)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .hoverFill(cornerRadius: 8)
+        .appTooltip("Edit or delete this comment")
+        .accessibilityLabel("Comment from \(comment.authorName): \(comment.body)")
     }
 }
