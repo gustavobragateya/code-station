@@ -299,7 +299,9 @@ enum SecondOpinion {
             if let effort = reviewer.effort { arguments += ["-c", "model_reasoning_effort=\"\(effort)\""] }
             // Read-only already permits reads outside the working directory. --add-dir
             // configures writable roots, which a review does not need.
-            return arguments + model + [prompt]
+            // "--" ends the options, so a list option such as --image cannot take the prompt
+            // as one more value and leave Codex waiting for one on stdin.
+            return arguments + model + ["--", prompt]
         case .copilot:
             // Copilot remembers what was allowed in a folder from one run to the next, and
             // a denial outranks every allowance, so writes and the shell are denied outright.
@@ -404,7 +406,9 @@ enum SecondOpinion {
         guard output.succeeded else {
             SessionLog.note("\(agent.command) read-only run failed status=\(output.status) "
                             + String(output.errorOutput.suffix(400)))
-            return .failure(Failure(message: "The \(agent.command) command stopped with status \(output.status)."))
+            let reason = output.errorOutput.split(whereSeparator: \.isNewline).map(String.init).last { !$0.isBlank }
+                .map { " " + String($0.prefix(200)) } ?? ""
+            return .failure(Failure(message: "The \(agent.command) command stopped with status \(output.status)." + reason))
         }
         return .success(output.output)
     }

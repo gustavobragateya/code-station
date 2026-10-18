@@ -164,7 +164,7 @@ struct DesignOpinionPanel: View {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(shown) { lane in
                     ReviewLane(reviewer: lane.reviewer, started: lane.started, ended: lane.ended,
-                               activity: lane.activity, state: lane.state,
+                               activity: lane.activity, state: lane.state, fillsWidth: true,
                                stop: { stop(lane.reviewer) }, retry: { retry(lane.reviewer) },
                                dismiss: { stop(lane.reviewer) })
                 }

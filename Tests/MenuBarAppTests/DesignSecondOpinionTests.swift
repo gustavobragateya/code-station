@@ -56,6 +56,8 @@ struct DesignSecondOpinionTests {
         let codexArguments = DesignSecondOpinion.arguments(for: codex, request: request(), prompt: "p")
         #expect(codexArguments.last == "p")
         #expect(codexArguments.contains(["--image", "/tmp/shots/approved-light.png", "--image", "/tmp/shots/approved-dark.png"]))
+        // --image takes any number of files, so only "--" keeps the prompt from being one of them.
+        #expect(Array(codexArguments.suffix(4)) == ["--image", "/tmp/shots/approved-dark.png", "--", "p"])
         #expect(codexArguments.contains("read-only"))
 
         let claude = DesignSecondOpinion.arguments(for: .init(agent: .claudeCode), request: request(), prompt: "p")

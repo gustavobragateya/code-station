@@ -717,14 +717,19 @@ struct ReviewLane: View {
     let stop: () -> Void
     let retry: () -> Void
     var dismiss: (() -> Void)?
+    // A lane in a narrow column takes the column's width and wraps a failure, where a lane in
+    // a row keeps to one line at its own width.
+    var fillsWidth = false
 
     init(reviewer: SecondOpinion.Reviewer, started: Date, ended: Date? = nil, activity: String,
-         state: State, stop: @escaping () -> Void, retry: @escaping () -> Void, dismiss: (() -> Void)? = nil) {
+         state: State, fillsWidth: Bool = false,
+         stop: @escaping () -> Void, retry: @escaping () -> Void, dismiss: (() -> Void)? = nil) {
         self.reviewer = reviewer
         self.started = started
         self.ended = ended
         self.activity = activity
         self.state = state
+        self.fillsWidth = fillsWidth
         self.stop = stop
         self.retry = retry
         self.dismiss = dismiss
@@ -733,11 +738,30 @@ struct ReviewLane: View {
     private var name: String { reviewer.label() }
 
     var body: some View {
+        Group {
+            if fillsWidth, case .failed(let message) = state {
+                failure(message)
+            } else {
+                line
+                    .padding(.leading, 8).padding(.trailing, 4)
+                    .frame(maxWidth: fillsWidth ? .infinity : nil, minHeight: 30, maxHeight: 30, alignment: .leading)
+            }
+        }
+        .font(.system(size: 11.5))
+        .surface(fill, cornerRadius: 8, border: border)
+        .fixedSize(horizontal: !fillsWidth, vertical: true)
+        .appTooltip(name)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(spoken)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var line: some View {
         HStack(spacing: 7) {
             switch state {
             case .running:
                 ProgressView().controlSize(.mini)
-                Text(reviewer.agent.title).font(.system(size: 12, weight: .semibold))
+                Text(reviewer.agent.title).font(.system(size: 12, weight: .semibold)).fixedSize()
                 if let seat = reviewer.seatLabel {
                     Text(seat)
                         .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.secondary)
@@ -746,7 +770,7 @@ struct ReviewLane: View {
                         .fixedSize()
                 }
                 Text(activity).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    .frame(maxWidth: 170, alignment: .leading)
+                    .frame(maxWidth: fillsWidth ? .infinity : 170, alignment: .leading)
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(Self.clock(from: started, to: context.date)).font(.mono(11)).foregroundStyle(.tertiary)
                 }
@@ -755,9 +779,10 @@ struct ReviewLane: View {
                     .accessibilityLabel("Stop \(name)")
             case .finished(let outcome):
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.dotOn)
-                Text(reviewer.agent.title).font(.system(size: 12, weight: .semibold))
+                Text(reviewer.agent.title).font(.system(size: 12, weight: .semibold)).fixedSize()
                 Text(outcome + " · " + Self.clock(from: started, to: ended ?? Date()))
                     .foregroundStyle(.secondary).lineLimit(1)
+                if fillsWidth { Spacer(minLength: 0) }
                 if let dismiss { GlyphButton(icon: "xmark", side: 20, action: dismiss).accessibilityLabel("Hide") }
             case .failed(let message):
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warningText)
@@ -770,15 +795,23 @@ struct ReviewLane: View {
                 if let dismiss { GlyphButton(icon: "xmark", side: 20, action: dismiss).accessibilityLabel("Hide") }
             }
         }
-        .font(.system(size: 11.5))
-        .padding(.leading, 8).padding(.trailing, 4)
-        .frame(height: 30)
-        .surface(fill, cornerRadius: 8, border: border)
-        .fixedSize()
-        .appTooltip(name)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(spoken)
-        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private func failure(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text("\(reviewer.agent.title) could not finish").font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 0)
+                if let dismiss { GlyphButton(icon: "xmark", side: 20, action: dismiss).accessibilityLabel("Hide") }
+            }
+            Text(message).foregroundStyle(Theme.warningText.opacity(0.8))
+                .fixedSize(horizontal: false, vertical: true)
+            InlineLink(title: "Try again", tint: Theme.warningText, action: retry)
+        }
+        .foregroundStyle(Theme.warningText)
+        .padding(.leading, 8).padding(.trailing, 4).padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var fill: Color {

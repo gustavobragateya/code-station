@@ -211,9 +211,9 @@ enum DesignSecondOpinion {
         let folders = request.reading.source ? [request.shotsDirectory] : []
         var arguments = SecondOpinion.arguments(for: reviewer, prompt: prompt, addDirectories: folders,
                                                 codexServers: codexServers, copilotServers: copilotServers)
-        if reviewer.agent == .codex, !arguments.isEmpty {
+        if reviewer.agent == .codex, let end = arguments.lastIndex(of: "--") {
             let images = request.shots.flatMap { [$0.light] + ($0.dark.map { [$0] } ?? []) }
-            arguments.insert(contentsOf: images.flatMap { ["--image", $0] }, at: arguments.count - 1)
+            arguments.insert(contentsOf: images.flatMap { ["--image", $0] }, at: end)
         }
         return arguments
     }
