@@ -403,22 +403,29 @@ struct ChangesView: View {
             if let review, mode == .changes,
                !files.isEmpty || !review.reviews.comments(review.sessionID).isEmpty
                 || !review.reviews.rounds(review.sessionID).isEmpty {
+                // Each card sits in a ZStack that is always there. When an overlay's
+                // content is a bare `if`, SwiftUI drops the overlay's alignment and the
+                // alignment guide, and the card hangs down from the bar, off the screen.
                 reviewStrip(review)
                     .overlay(alignment: .topTrailing) {
-                        if showsPicker {
-                            secondOpinionPicker(review)
-                                .padding(.trailing, 20)
-                                .alignmentGuide(.top) { $0[.bottom] + 8 }
-                                .transition(.opacity.combined(with: .offset(y: 6)))
+                        ZStack {
+                            if showsPicker {
+                                secondOpinionPicker(review)
+                                    .transition(.opacity.combined(with: .offset(y: 6)))
+                            }
                         }
+                        .padding(.trailing, 20)
+                        .alignmentGuide(.top) { $0[.bottom] + 8 }
                     }
                     .overlay(alignment: .top) {
-                        if let toast {
-                            ReviewToastView(toast: toast) { self.toast = nil }
-                                .alignmentGuide(.top) { $0[.bottom] + 10 }
-                                .transition(.opacity)
-                                .id(toast.id)
+                        ZStack {
+                            if let toast {
+                                ReviewToastView(toast: toast) { self.toast = nil }
+                                    .transition(.opacity)
+                                    .id(toast.id)
+                            }
                         }
+                        .alignmentGuide(.top) { $0[.bottom] + 10 }
                     }
                     .zIndex(1)
             }
