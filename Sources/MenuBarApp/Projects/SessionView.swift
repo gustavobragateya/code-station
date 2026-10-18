@@ -229,9 +229,7 @@ struct SessionView: View {
     // already there the next time this session opens.
     @State private var statsTask: Task<Void, Never>?
     @State private var designHasContent: Bool?
-    // Where the find and recap buttons sit in the window, so their panels grow out of
-    // them and go back into them.
-    @State private var findOrigin: CGPoint?
+    // Where the recap button sits in the window, so its panel grows out of it.
     @State private var recapOrigin: CGPoint?
     @State private var railNotes = 0
     @State private var railNote: String?
@@ -766,7 +764,6 @@ struct SessionView: View {
             }
         }
         .disabled(session.isActivelyDesigning)
-        .onCentreChange { findOrigin = $0 }
     }
 
     private func workingSetSeat(_ session: ChatSession, showsWord: Bool) -> some View {
@@ -1535,7 +1532,8 @@ struct SessionView: View {
                         focused: $findFocused,
                         move: { transcriptFind.move(by: $0) },
                         close: closeFind)
-                    .transition(.grow(from: findOrigin, reduceMotion: reduceMotion))
+                    // The field must be fully visible as soon as it takes focus.
+                    .transition(.identity)
             }
             transcript(session)
             Divider().overlay(Theme.hairline)
