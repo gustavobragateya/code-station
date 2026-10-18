@@ -11,7 +11,6 @@ struct ProjectDetailView: View {
     @Environment(SessionRunner.self) private var runner
     @Environment(ShortcutStore.self) private var shortcuts
     @Environment(DialogPresenter.self) private var dialogs
-    @Environment(AppSettings.self) private var appSettings
     @Environment(WorkingTreeWatch.self) private var workingTrees
     @Environment(OrphanedWorktreeMonitor.self) private var orphanedWorktreeMonitor
     @Environment(TerminalStore.self) private var terminals
@@ -108,9 +107,6 @@ struct ProjectDetailView: View {
             // Held at their natural width so a long project name is what gives way,
             // rather than the controls shrinking until their labels wrap.
             HStack(spacing: 12) {
-                if appSettings.mobileAccessEnabled {
-                    MobileAccessButton(scope: .project(project.id))
-                }
                 HeaderTabToggle(selection: $tab,
                                 options: [("Sessions", .sessions),
                                           ("Changes", .changes),

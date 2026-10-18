@@ -58,9 +58,8 @@ struct MobileShare: Identifiable, Equatable {
     var isConnected: Bool { connectionID != nil }
 }
 
-// One code that is out there, named and told apart from the others. The codes are made in
-// three different corners of the app, so the header needs them gathered and described in
-// one place to be able to list them and take any of them back.
+// One code that is out there, named and told apart from the others, so the header can
+// list every code in one place and take any of them back.
 struct MobileShareSummary: Identifiable {
     let id: UUID
     let scope: MobileScope

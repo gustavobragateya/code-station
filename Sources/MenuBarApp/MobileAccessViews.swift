@@ -20,8 +20,6 @@ enum MobilePairing {
             width: 390))
     }
 
-    static var menuLabel: String { "Pair phone - QR code" }
-
     private static func title(_ scope: MobileScope, store: ProjectStore) -> String {
         switch scope {
         case .session: "Open this session on your phone"
@@ -56,7 +54,7 @@ enum PhoneLink: Equatable {
         return shared ? .waiting : .none
     }
 
-    // The words the rail shows. The pairing does not say what the phone is called, so it
+    // The words the pill shows. The pairing does not say what the phone is called, so it
     // is named as a phone.
     var word: String? {
         switch self {
@@ -83,75 +81,34 @@ enum PhoneLink: Equatable {
     }
 }
 
-// The QR button as a header wears it. The same control sits on a session, on a project and
-// on Home; what changes is how far the code it makes can reach.
+// The phone pill on the Home header, the one place a code is handed out. Every code
+// reaches the whole app, so a phone is either in on everything or on nothing.
 struct MobileAccessButton: View {
-    let scope: MobileScope
-    // Smaller where it shares a line with the session's own facts rather than sitting in
-    // a header of its own.
-    var side: CGFloat = 30
-    // On the session header the button becomes a capsule that names the link once there
-    // is one, since it is the only thing on the rail that speaks for something outside
-    // the app.
-    var onRail = false
-    var showsWord = true
-    // Home has the room to say what the button is for even before anything is shared, and
-    // it is where someone looks for a way to take the app with them.
-    var named = false
-
     @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(DialogPresenter.self) private var dialogs
     @Environment(ProjectStore.self) private var store
 
     var body: some View {
-        let share = mobileAccess.share(for: scope)
-        let connected = mobileAccess.isLive(scope)
-        let label = tooltip(shared: share != nil, connected: connected)
-        return Group {
-            if onRail || named {
-                PhoneCapsule(link: .of(shared: share != nil, connected: connected),
-                             showsWord: showsWord,
-                             named: named,
-                             label: label,
-                             action: open)
-            } else {
-                let tint = if connected {
-                    Theme.addition
-                } else if share != nil {
-                    Theme.accent
-                } else {
-                    Color.secondary
-                }
-                GlyphButton(icon: "qrcode", side: side, tint: tint, action: open)
-                    .appTooltip(label)
-                    .accessibilityLabel(label)
-            }
+        let shared = mobileAccess.share(for: .everything) != nil
+        let connected = mobileAccess.isLive(.everything)
+        PhonePill(link: .of(shared: shared, connected: connected),
+                  label: tooltip(shared: shared, connected: connected)) {
+            MobilePairing.open(scope: .everything, dialogs: dialogs, store: store)
         }
     }
 
     private func tooltip(shared: Bool, connected: Bool) -> String {
         if connected { return "Phone connected" }
         if shared { return "Shared with a phone" }
-        return switch scope {
-        case .session: "Open this session on a phone"
-        case .project: "Open this project on a phone"
-        case .everything: "Open Code Station on a phone"
-        }
-    }
-
-    private func open() {
-        MobilePairing.open(scope: scope, dialogs: dialogs, store: store)
+        return "Open Code Station on a phone"
     }
 }
 
-// The phone button on the session rail. With nothing shared it is a bare QR glyph; once a
-// code is out it fills amber and says it is waiting, and once a phone joins it turns green
-// with a slow ring around its light. A named one is a bordered pill that says "Open on
-// phone" while nothing is shared, and lets a peek card explain what that means.
-private struct PhoneCapsule: View {
+// A bordered pill that says "Open on phone" while nothing is shared, and lets a peek card
+// explain what that means. Once a code is out it fills amber and says it is waiting, and
+// once a phone joins it turns green with a slow ring around its light.
+private struct PhonePill: View {
     let link: PhoneLink
-    let showsWord: Bool
-    var named = false
     let label: String
     let action: () -> Void
 
@@ -162,56 +119,6 @@ private struct PhoneCapsule: View {
     static let offer = "Open on phone"
 
     var body: some View {
-        if named {
-            namedPill
-        } else {
-            capsule
-        }
-    }
-
-    private var capsule: some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                switch link {
-                case .none:
-                    Image(systemName: "qrcode")
-                        .font(.system(size: 13, weight: .semibold))
-                case .waiting:
-                    Circle()
-                        .fill(Theme.attention)
-                        .frame(width: 6, height: 6)
-                case .connected:
-                    PulsingDot(colour: Theme.addition, size: 6)
-                }
-                if showsWord, let word = link.word {
-                    Text(word)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(1)
-                        .fixedSize()
-                        .transition(.opacity)
-                }
-            }
-            .foregroundStyle(link == .none && hovering ? Color.primary : link.tint)
-            .padding(.horizontal, link == .none ? 8 : 10)
-            .frame(minWidth: 30, minHeight: 30)
-            .background(Capsule().fill(link.fill ?? (hovering ? Theme.field : Color.clear)))
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .motion(Motion.hover, value: hovering)
-        .motion(HeaderMotion.slide, value: link)
-        .appTooltip(delay: .zero) {
-            Tooltip(title: label,
-                    subtitle: link == .none
-                        ? "Scan a code to follow this session"
-                        : "Show the code or stop sharing")
-        }
-        .accessibilityLabel("Phone")
-        .accessibilityValue(link.word ?? "Not shared")
-    }
-
-    private var namedPill: some View {
         let offering = link == .none
         return Button(action: action) {
             HStack(spacing: 8) {

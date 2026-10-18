@@ -166,7 +166,6 @@ struct SessionView: View {
     @Environment(MenuPresenter.self) private var menus
     @Environment(AppSettings.self) private var appSettings
     @Environment(GitStatsCache.self) private var gitStats
-    @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(ShortcutStore.self) private var shortcuts
     @Environment(GlobalCommandPaletteController.self) private var commandPalette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -811,9 +810,6 @@ struct SessionView: View {
                     toggle: toggleRecap)
                 .onCentreChange { recapOrigin = $0 }
             }
-            if appSettings.mobileAccessEnabled {
-                MobileAccessButton(scope: .session(sessionID), onRail: true)
-            }
         }
     }
 
@@ -893,14 +889,6 @@ struct SessionView: View {
             entries.append(.item("Session recap", icon: "lightbulb",
                                  showsUpdate: recapNeedsAttention, action: toggleRecap))
         }
-        if appSettings.mobileAccessEnabled {
-            let link = PhoneLink.of(shared: mobileAccess.share(for: .session(sessionID)) != nil,
-                                    connected: mobileAccess.isLive(.session(sessionID)))
-            entries.append(.item(MobilePairing.menuLabel, icon: "qrcode",
-                                 subtitle: link.word ?? "Not shared") {
-                MobilePairing.open(scope: .session(sessionID), dialogs: dialogs, store: store)
-            })
-        }
         return entries
     }
 
@@ -912,7 +900,7 @@ struct SessionView: View {
 
     private func hasUtilities(session: ChatSession) -> Bool {
         session.worktreePath != nil || showsDesignMaterialExport(session)
-            || showsRecap || appSettings.mobileAccessEnabled
+            || showsRecap
     }
 
     // A design session is recapped through the conversation it belongs to, so what the
