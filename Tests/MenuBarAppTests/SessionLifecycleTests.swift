@@ -223,6 +223,27 @@ struct SessionLifecycleTests {
         #expect(ProjectStore(storeURL: store.storeURL).session(session.id) == nil)
     }
 
+    @Test func aSecondOpinionAtWorkKeepsTheSessionRunning() throws {
+        let runner = SessionRunner(paths: [:])
+        let project = try TestStore.project(in: store, named: "project")
+        let session = store.newSession(in: project.id)
+        #expect(SessionTone(session.id, store: store, runner: runner) == .idle)
+
+        // The repository has no changes, so the run would end on its own; it is stopped
+        // before it gets the chance.
+        let request = SecondOpinionRequest(repositories: [ReviewRepository(root: scratch.url.path, name: "App")],
+                                           executable: "/usr/bin/false")
+        runner.reviews.startSecondOpinion(session.id, reviewer: .init(agent: .codex), request: request)
+
+        #expect(runner.state(session.id).isBusy == false)
+        #expect(runner.isBusy(session.id, store: store))
+        #expect(SessionTone(session.id, store: store, runner: runner) == .running)
+
+        runner.reviews.stopSecondOpinion(session.id)
+        #expect(!runner.isBusy(session.id, store: store))
+        #expect(SessionTone(session.id, store: store, runner: runner) == .idle)
+    }
+
     @Test func blocksNewPromptsWhileRemovalIsInProgress() throws {
         let runner = SessionRunner()
         let project = try TestStore.project(in: store, named: "project")

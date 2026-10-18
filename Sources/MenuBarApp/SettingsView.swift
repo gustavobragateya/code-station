@@ -1192,7 +1192,7 @@ struct SettingsView: View {
             SettingsCard {
                 SettingsToggleRow(
                     "Mobile access",
-                    detail: "Puts a QR code on Home, on every project and on every session. A phone on the same trusted Wi-Fi can read and run whatever the code it scanned covers.",
+                    detail: "Puts a QR code on Home. A phone on the same trusted Wi-Fi that scans it can read and run every session in every project.",
                     isOn: $settings.mobileAccessEnabled)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 13)

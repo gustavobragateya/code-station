@@ -166,7 +166,6 @@ struct SessionView: View {
     @Environment(MenuPresenter.self) private var menus
     @Environment(AppSettings.self) private var appSettings
     @Environment(GitStatsCache.self) private var gitStats
-    @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(ShortcutStore.self) private var shortcuts
     @Environment(GlobalCommandPaletteController.self) private var commandPalette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -229,9 +228,7 @@ struct SessionView: View {
     // already there the next time this session opens.
     @State private var statsTask: Task<Void, Never>?
     @State private var designHasContent: Bool?
-    // Where the find and recap buttons sit in the window, so their panels grow out of
-    // them and go back into them.
-    @State private var findOrigin: CGPoint?
+    // Where the recap button sits in the window, so its panel grows out of it.
     @State private var recapOrigin: CGPoint?
     @State private var railNotes = 0
     @State private var railNote: String?
@@ -326,7 +323,8 @@ struct SessionView: View {
                                                  initialPath: requestedChange?.path,
                                                  selectedRoot: Binding(get: { projectDirectory }, set: { root in
                                                      selectWorkspaceRoot(root, in: session)
-                                                 }), navigation: changesNavigation)
+                                                 }), navigation: changesNavigation,
+                                                 reviewSent: { tab = .conversation })
                             if let reviewingEnding,
                                reviewingEnding == runner.lastTurnEnding(sessionID)?.ended,
                                !runner.state(sessionID).isBusy {
@@ -765,7 +763,6 @@ struct SessionView: View {
             }
         }
         .disabled(session.isActivelyDesigning)
-        .onCentreChange { findOrigin = $0 }
     }
 
     private func workingSetSeat(_ session: ChatSession, showsWord: Bool) -> some View {
@@ -812,9 +809,6 @@ struct SessionView: View {
                     needsAttention: recapNeedsAttention,
                     toggle: toggleRecap)
                 .onCentreChange { recapOrigin = $0 }
-            }
-            if appSettings.mobileAccessEnabled {
-                MobileAccessButton(scope: .session(sessionID), onRail: true)
             }
         }
     }
@@ -895,14 +889,6 @@ struct SessionView: View {
             entries.append(.item("Session recap", icon: "lightbulb",
                                  showsUpdate: recapNeedsAttention, action: toggleRecap))
         }
-        if appSettings.mobileAccessEnabled {
-            let link = PhoneLink.of(shared: mobileAccess.share(for: .session(sessionID)) != nil,
-                                    connected: mobileAccess.isLive(.session(sessionID)))
-            entries.append(.item(MobilePairing.menuLabel, icon: "qrcode",
-                                 subtitle: link.word ?? "Not shared") {
-                MobilePairing.open(scope: .session(sessionID), dialogs: dialogs, store: store)
-            })
-        }
         return entries
     }
 
@@ -914,7 +900,7 @@ struct SessionView: View {
 
     private func hasUtilities(session: ChatSession) -> Bool {
         session.worktreePath != nil || showsDesignMaterialExport(session)
-            || showsRecap || appSettings.mobileAccessEnabled
+            || showsRecap
     }
 
     // A design session is recapped through the conversation it belongs to, so what the
@@ -1534,7 +1520,8 @@ struct SessionView: View {
                         focused: $findFocused,
                         move: { transcriptFind.move(by: $0) },
                         close: closeFind)
-                    .transition(.grow(from: findOrigin, reduceMotion: reduceMotion))
+                    // The field must be fully visible as soon as it takes focus.
+                    .transition(.identity)
             }
             transcript(session)
             Divider().overlay(Theme.hairline)
@@ -1716,6 +1703,7 @@ struct SessionView: View {
                                    state: SessionState, projectPath: String,
                                    loadEarlier: @escaping () -> Void) -> some View {
         let bubble = appSettings.userMessageStyle(for: session, in: store)
+        let reviewRounds = sentReviews(in: session)
         return VStack(alignment: .leading, spacing: 18) {
             // Only for a session that has nothing to say yet, never for one whose
             // conversation is still being read in.
@@ -1749,7 +1737,11 @@ struct SessionView: View {
             }
 
             ForEach(messages) { message in
-                MessageView(message: message,
+                if let round = reviewRounds.cards[message.id] {
+                    reviewCard(round, session: session, working: state.isBusy, projectPath: projectPath)
+                        .transition(.fadeIn)
+                } else if !reviewRounds.hidden.contains(message.id) {
+                MessageView(message: reviewRounds.cuts[message.id].map { message.cut(at: $0) } ?? message,
                             projectPath: projectPath,
                             textScale: appSettings.textSize.scale,
                             openChange: { path in
@@ -1761,7 +1753,11 @@ struct SessionView: View {
                             showInExplorer: showInExplorer,
                             promptMenu: promptMenu(for: message),
                             arriving: message.isArriving(sentAt: promptSentAt),
-                            bubble: bubble)
+                            bubble: bubble,
+                            secondOpinion: canJudge(message, in: session, state: state) ? {
+                                askForSecondOpinion(on: answerSubject(message, in: session),
+                                                    anchor: message.id, session: session)
+                            } : nil)
                     // Every message is on screen now, and a streaming turn rewrites
                     // the last one many times a second. Without this, each of those
                     // redraws every message in the transcript, parsing its markdown
@@ -1771,6 +1767,11 @@ struct SessionView: View {
                     .environment(\.activeTranscriptTools, runner.runningTools(sessionID))
                     .environment(\.agentTranscriptFocus, agentFocus)
                     .transition(.fadeIn)
+                }
+                ForEach(opinions(after: message.id)) { opinion in
+                    opinionCard(opinion, session: session)
+                        .transition(.fadeIn)
+                }
             }
 
             if !state.isBusy, let ending = runner.lastTurnEnding(sessionID),
@@ -1782,8 +1783,7 @@ struct SessionView: View {
                          review: runner.question(sessionID) == nil ? {
                              reviewingEnding = ending.ended
                              focusHandoffReview = false
-                             changesNavigation.showingHistory = false
-                             openChanges()
+                             Task { await openTurnChanges(ending, in: session) }
                          } : nil)
                     .id(ending.ended)
                     .transition(.identity)
@@ -1886,6 +1886,104 @@ struct SessionView: View {
         }
     }
 
+    // Reviews sent from Changes, matched to the messages that carried them. Each shows as
+    // one card where its prompt would be. The answers the agent wrote under each comment's
+    // heading live in the card's threads, so they are cut from the turn's text, and a reply
+    // sent in a thread is left to the thread instead of showing as a message of its own.
+    private func sentReviews(in session: ChatSession) -> (cards: [UUID: ReviewRound], hidden: Set<UUID>,
+                                                          cuts: [UUID: Int]) {
+        let reviews = runner.reviews
+        let rounds = reviews.rounds(sessionID)
+        guard !rounds.isEmpty else { return ([:], [], [:]) }
+        var cards: [UUID: ReviewRound] = [:]
+        var hidden: Set<UUID> = []
+        var cuts: [UUID: Int] = [:]
+        let messages = session.messages
+        for (index, message) in messages.enumerated() where message.role == .user {
+            let prompt = message.text.trimmed
+            let count: Int
+            let settled: Bool
+            if let round = rounds.last(where: { $0.prompt == prompt }) {
+                cards[message.id] = round
+                count = round.comments.count
+                settled = round.isSettled
+            } else if reviews.isThreadReply(prompt: prompt, in: sessionID) {
+                hidden.insert(message.id)
+                count = 1
+                settled = reviews.awaitingReply(prompt: prompt, in: sessionID) == nil
+            } else {
+                continue
+            }
+            guard let reply = messages[(index + 1)...].prefix(while: { $0.role != .user })
+                .last(where: { $0.role == .assistant }) else { continue }
+            // While the turn runs, only text under a heading is known to be an answer.
+            let cut = settled ? ReviewAnswers.read(reply, count: count)?.start : ReviewAnswers.split(reply.text)?.start
+            guard let cut else { continue }
+            if reply.cut(at: cut).isEmpty { hidden.insert(reply.id) } else { cuts[reply.id] = cut }
+        }
+        return (cards, hidden, cuts)
+    }
+
+    private func reviewCard(_ round: ReviewRound, session: ChatSession, working: Bool,
+                            projectPath: String) -> some View {
+        let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
+        let checker = installed.first { $0 != session.agent } ?? installed.first
+        let reviews = runner.reviews
+        let directories = store.workingDirectories(for: session)
+        let names = Dictionary(directories.map { ($0, ($0 as NSString).lastPathComponent) },
+                               uniquingKeysWith: { first, _ in first })
+        return ReviewCard(
+            round: round, agent: session.agent, working: working, checker: checker,
+            projectPath: projectPath, textScale: appSettings.textSize.scale,
+            fileName: { ($0.path as NSString).lastPathComponent },
+            openInChanges: {
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                openChanges()
+            },
+            reply: { comment, text in
+                Task {
+                    guard let prompt = await reviews.reply(text, to: comment.id, round: round.id, in: sessionID,
+                                                           projectNames: names) else { return }
+                    runner.send(prompt, sessionID: sessionID, store: store)
+                }
+            },
+            resolve: { reviews.resolve($0.id, round: round.id, in: sessionID) },
+            reopen: { reviews.reopen($0.id, round: round.id, in: sessionID) },
+            showInDiff: { comment in
+                reviews.markRead(comment.id, in: sessionID)
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                changesNavigation.focusedComment = comment.id
+                openChange(comment.path, root: comment.root)
+            },
+            reviewWhatChanged: openChanges,
+            checkFixes: {
+                guard let checker, let executable = runner.executable(for: checker) else { return }
+                let repositories = directories.map {
+                    ReviewRepository(root: $0, name: ($0 as NSString).lastPathComponent)
+                }
+                let seat = Preferences.secondOpinionLineup().first { $0.agent == checker }
+                    ?? SecondOpinion.Reviewer(agent: checker)
+                reviews.startSecondOpinion(sessionID, reviewer: seat, request: SecondOpinionRequest(
+                    scope: .sinceReview(trees: round.trees), repositories: repositories, executable: executable))
+                changesNavigation.showingHistory = false
+                changesNavigation.showingReview = true
+                openChanges()
+            })
+            // Answers read here are read: the thread is open in front of the person.
+            .onChange(of: round.unread, initial: true) { _, unread in
+                for id in unread { reviews.markRead(id, in: sessionID) }
+            }
+            // A round whose turn ended while nothing was watching, or before the app was
+            // last quit, is settled as soon as it is seen.
+            .task(id: "\(round.id)-\(working)") {
+                guard !working, !round.isSettled else { return }
+                let reply = store.session(sessionID).flatMap { ReviewAnswers.reply(to: round.prompt, in: $0.messages) }
+                await reviews.turnEnded(sessionID, prompt: round.prompt, reply: reply)
+            }
+    }
+
     private func returnToHandoff() {
         focusHandoffReview = true
         tab = .conversation
@@ -1894,6 +1992,26 @@ struct SessionView: View {
     private func openChanges() {
         requestedChange = nil
         tab = .changes
+    }
+
+    // A turn that committed its work leaves nothing in the working tree, so its review is
+    // the range of commits it made instead. Uncommitted work anywhere keeps the review on
+    // the working tree, where it can be commented on and committed.
+    private func openTurnChanges(_ ending: TurnEnding, in session: ChatSession) async {
+        let committed = await GitInspector.turnCommits(roots: store.workingDirectories(for: session),
+                                                       startHeads: ending.startHeads)
+        guard reviewingEnding == ending.ended else { return }
+        guard let committed else {
+            changesNavigation.showingHistory = false
+            openChanges()
+            return
+        }
+        let history = changesNavigation.history(for: committed.root)
+        history.select(committed.head)
+        history.parent = committed.start
+        changesNavigation.showingHistory = true
+        selectWorkspaceRoot(committed.root, in: session)
+        openChanges()
     }
 
     private func openChange(_ path: String, root: String) {
@@ -1991,14 +2109,108 @@ struct SessionView: View {
     // happen belongs. The turn is parked until it is answered.
     @ViewBuilder private func pendingQuestion(projectPath: String) -> some View {
         if let request = runner.question(sessionID) {
+            let session = store.session(sessionID)
             PermissionCard(request: request,
-                           workingDirectories: store.session(sessionID)
-                               .map(store.workingDirectories(for:)) ?? [],
-                           projectPath: projectPath) { answer in
+                           workingDirectories: session.map(store.workingDirectories(for:)) ?? [],
+                           projectPath: projectPath,
+                           secondOpinion: session.map { session in
+                               { askForSecondOpinion(on: planSubject(request, in: session),
+                                                     anchor: session.messages.last(where: { !$0.isEmpty })?.id, session: session) }
+                           }) { answer in
                 runner.answer(request, with: answer, sessionID: sessionID, store: store)
             }
             .id(request.id)
+            if let session, let opinion = runner.opinions.opinion(on: Self.planID(request), in: sessionID) {
+                opinionCard(opinion, session: session)
+                    .transition(.fadeIn)
+            }
         }
+    }
+
+    // MARK: - Second opinion in Chat
+
+    private static func planID(_ request: PermissionRequest) -> String { "plan:" + request.id }
+
+    // The plan waiting on an answer, judged against the request that led to it.
+    private func planSubject(_ request: PermissionRequest, in session: ChatSession) -> ChatSecondOpinion.Subject {
+        ChatSecondOpinion.Subject(kind: .plan, id: Self.planID(request), text: request.subject,
+                                  request: session.messages.last(where: { $0.role == .user })?.text ?? "")
+    }
+
+    private func answerSubject(_ message: ChatMessage, in session: ChatSession) -> ChatSecondOpinion.Subject {
+        let index = session.messages.firstIndex { $0.id == message.id } ?? session.messages.endIndex
+        let asked = session.messages[..<index].last { $0.role == .user }?.text ?? ""
+        return ChatSecondOpinion.Subject(kind: .answer, id: "answer:" + message.id.uuidString,
+                                         text: message.text, request: asked)
+    }
+
+    // An answer can be judged once it is whole: not while its turn is still writing it.
+    private func canJudge(_ message: ChatMessage, in session: ChatSession, state: SessionState) -> Bool {
+        guard message.role == .assistant, !message.text.isBlank else { return false }
+        return !(state.isBusy && session.messages.last?.id == message.id)
+    }
+
+    // Cards joined to a message. The one on a plan still waiting sits under the plan.
+    private func opinions(after messageID: UUID) -> [ChatOpinion] {
+        let pending = runner.question(sessionID).map(Self.planID)
+        return runner.opinions.opinions(sessionID).filter { $0.anchor == messageID && $0.subject.id != pending }
+    }
+
+    private func askForSecondOpinion(on subject: ChatSecondOpinion.Subject, anchor: UUID?, session: ChatSession) {
+        let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
+        let author = runner.author(of: session)
+        dialogs.show(Dialog(
+            title: "Ask for a second opinion",
+            content: AnyView(ChatOpinionAsk(
+                subject: subject, author: author, installed: installed,
+                ask: { lineup, focus, reading in
+                    dialogs.dismiss()
+                    let executables = Dictionary(uniqueKeysWithValues: installed.compactMap { agent in
+                        runner.executable(for: agent).map { (agent, $0) }
+                    })
+                    runner.opinions.ask(
+                        ChatSecondOpinion.Request(subject: subject, focus: focus, reading: reading,
+                                                  conversation: reading.conversation
+                                                    ? SideQuestion.recentChat(session.messages) : "",
+                                                  directories: store.workingDirectories(for: session),
+                                                  executable: ""),
+                        reviewers: lineup, executables: executables, anchor: anchor, in: sessionID)
+                })),
+            actions: [], width: 620, framesItself: true))
+    }
+
+    private func opinionCard(_ opinion: ChatOpinion, session: ChatSession) -> some View {
+        let pending = runner.question(sessionID).flatMap { Self.planID($0) == opinion.subject.id ? $0 : nil }
+        let opinions = runner.opinions
+        return ChatOpinionCard(
+            opinion: opinion, authorTitle: session.agent.title, planPending: pending != nil,
+            toggle: { opinions.toggle($0, of: opinion.id, in: sessionID) },
+            send: {
+                let names = Array(NSOrderedSet(array: opinion.lanes.map(\.reviewer.agent.title))) as? [String] ?? []
+                let text = ChatSecondOpinion.feedback(opinion.ticked, subject: opinion.subject,
+                                                      names: names.joined(separator: " and "))
+                // A plan still waiting goes back as its answer, so the agent keeps
+                // planning with the points in mind rather than being told no.
+                if let pending {
+                    runner.answer(pending, with: .revise(text), sessionID: sessionID, store: store)
+                } else {
+                    runner.send(text, sessionID: sessionID, store: store)
+                }
+                opinions.markSent(opinion.id, count: opinion.ticked.count, in: sessionID)
+            },
+            approve: {
+                guard let pending else { return }
+                runner.answer(pending, with: .allowOnce, sessionID: sessionID, store: store)
+            },
+            askAgain: {
+                askForSecondOpinion(on: opinion.subject, anchor: opinion.anchor, session: session)
+            },
+            retry: { seat in
+                guard let executable = runner.executable(for: seat.agent) else { return }
+                opinions.retry(seat, of: opinion.id, executable: executable, in: sessionID)
+            },
+            stop: { opinions.stop($0, of: opinion.id, in: sessionID) },
+            dismiss: { opinions.dismiss(opinion.id, in: sessionID) })
     }
 
     // A running turn shows the row for as long as it runs, whatever the transcript looks

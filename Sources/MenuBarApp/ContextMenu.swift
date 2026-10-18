@@ -227,9 +227,10 @@ extension View {
     // slow external state current without delaying the menu opening.
     func appMenu(edge: VerticalEdge = .bottom,
                  matchWidth: Bool = false,
+                 showsFocusRing: Bool = false,
                  refreshOnOpen: (() async -> Void)? = nil,
                  _ entries: @escaping () -> [MenuEntry]) -> some View {
-        modifier(AppMenuButton(edge: edge, matchWidth: matchWidth,
+        modifier(AppMenuButton(edge: edge, matchWidth: matchWidth, showsFocusRing: showsFocusRing,
                                refreshOnOpen: refreshOnOpen, entries: entries))
     }
 }
@@ -249,6 +250,7 @@ private struct AppMenuButton: ViewModifier {
     @Environment(MenuPresenter.self) private var presenter
     let edge: VerticalEdge
     let matchWidth: Bool
+    let showsFocusRing: Bool
     let refreshOnOpen: (() async -> Void)?
     let entries: () -> [MenuEntry]
 
@@ -269,6 +271,12 @@ private struct AppMenuButton: ViewModifier {
         .buttonStyle(.plain)
         .background(FrameAnchorView(anchor: anchor))
         .focused($triggerFocused)
+        .focusEffectDisabled(showsFocusRing)
+        .overlay {
+            if showsFocusRing {
+                FocusRingStroke(focused: triggerFocused)
+            }
+        }
         .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
         .onChange(of: isOpen) { wasOpen, nowOpen in
             if wasOpen && !nowOpen && !presenter.isOpen { triggerFocused = true }

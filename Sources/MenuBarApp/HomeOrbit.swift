@@ -116,6 +116,8 @@ struct OrbitLayout {
     // Room for the ring with space around it, and for a medium day's column of pills, so
     // the map keeps one height on most days.
     static let minHeight: CGFloat = hubSide + 2 * margin + 76
+    // Room above the map for the phone pills and the line that runs from them to the ring.
+    static let phoneBand: CGFloat = 76
 
     // How much height a project takes when it has a single session: the tile, its halo and
     // the name under it.
@@ -129,6 +131,8 @@ struct OrbitLayout {
 
     let size: CGSize
     let hub: CGPoint
+    // How far the map is pushed down to make room for the phone pills.
+    let phoneBand: CGFloat
     let pillWidth: CGFloat
     let shownPerProject: Int
     // The most arcs on either side of the ring, which is how long the ring takes to draw.
@@ -145,7 +149,8 @@ struct OrbitLayout {
             + arcs.map { CGRect(x: $0.start, y: $0.end, width: 0, height: 0) }
     }
 
-    init(map: HomeWorkMap, width: CGFloat) {
+    init(map: HomeWorkMap, width: CGFloat, phoneBand: CGFloat = 0) {
+        self.phoneBand = phoneBand
         let groups = map.groups
         let shownPerProject = map.active.count > Self.roomyDay ? 2 : 3
         self.shownPerProject = shownPerProject
@@ -164,10 +169,10 @@ struct OrbitLayout {
         let columnHeights = columns.map { column, _ in
             column.map(extent).reduce(0, +) + Self.rowGap * CGFloat(max(column.count - 1, 0))
         }
-        let height = max(Self.minHeight, (columnHeights.max() ?? 0) + 2 * Self.margin)
-        size = CGSize(width: width, height: height)
+        let mapHeight = max(Self.minHeight, (columnHeights.max() ?? 0) + 2 * Self.margin)
+        size = CGSize(width: width, height: mapHeight + phoneBand)
         let centerX = width / 2
-        let centerY = height / 2
+        let centerY = phoneBand + mapHeight / 2
         hub = CGPoint(x: centerX, y: centerY)
 
         let reach = min(240, max(200, width * 0.19))
@@ -244,6 +249,11 @@ struct OrbitLayout {
             }
             steps = max(steps, total)
         }
+    }
+
+    // Where a phone's line meets the ring: the top of the project ring, just outside it.
+    var ringTop: CGPoint {
+        CGPoint(x: hub.x, y: hub.y - Self.projectRingRadius - 5)
     }
 
     // A session that needs you is the one tall shape on the map, so it is found first.
@@ -360,10 +370,14 @@ struct OrbitMap: View {
     let onOpened: () -> Void
 
     @Environment(ProjectStore.self) private var store
+    @Environment(MobileAccessController.self) private var mobileAccess
+    @Environment(DialogPresenter.self) private var dialogs
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selected: UUID?
     @State private var cardHeight: CGFloat = 240
     @State private var pointed: OrbitSpotlight?
+    @State private var beaconFrame: CGRect?
+    @State private var ripples = 0
     // False only until a map that opens has appeared. Everything on the map reads it,
     // each part with its own delay, so the opening is one change played in order.
     @State private var built: Bool
@@ -386,8 +400,10 @@ struct OrbitMap: View {
     }
 
     var body: some View {
-        let layout = OrbitLayout(map: map, width: width)
+        let phone = phoneLink
+        let layout = OrbitLayout(map: map, width: width, phoneBand: phone == nil ? 0 : OrbitLayout.phoneBand)
         let opening = OrbitOpening(layout: layout)
+        let reach = OrbitPhoneReach(link: phone, map: map)
         // Pointing at a project in the sidebar lights it here too.
         let spotlight = pointed ?? store.navigation.pointedSidebarItem.map(OrbitSpotlight.project)
         ZStack(alignment: .topLeading) {
@@ -395,7 +411,18 @@ struct OrbitMap: View {
                 .contentShape(Rectangle())
                 .onTapGesture { selected = nil }
 
-            OrbitWires(wires: layout.wires, built: built, opening: opening, spotlight: spotlight)
+            OrbitWires(wires: layout.wires, built: built, opening: opening, spotlight: spotlight,
+                       phoneLit: reach.wires)
+
+            if let phone, let beaconFrame {
+                OrbitPhoneSignal(link: phone.link, start: CGPoint(x: beaconFrame.midX, y: beaconFrame.maxY + 2),
+                                 end: layout.ringTop)
+                    .frame(width: layout.size.width, height: layout.size.height)
+                    .transition(.opacity)
+            }
+
+            OrbitPhoneRipple(trigger: ripples)
+                .position(layout.hub)
 
             OrbitRing(layout: layout, map: map, built: built, opening: opening, spotlight: spotlight,
                       select: { toggle($0) }, point: { point($0, at: $1) })
@@ -422,6 +449,7 @@ struct OrbitMap: View {
             ForEach(Array(layout.pills.enumerated()), id: \.element.id) { index, pill in
                 let live = pill.live
                 OrbitSessionPill(live: live, selected: selected == pill.id, left: pill.left, built: built,
+                                 onPhone: reach.sessions.contains(live.id),
                                  entrance: step(opening.pill(index), OrbitOpening.slide)) {
                     toggle(live.id)
                 } point: { point(.session(live.id, group: live.containerID), at: $0) }
@@ -440,18 +468,54 @@ struct OrbitMap: View {
                     .opacity(OrbitSpotlight.opacity(spotlight, group: more.group.id))
             }
 
+            if let phone {
+                beacon(phone, layout: layout)
+            }
+
             if let selected, let live = map.active.first(where: { $0.id == selected }) {
                 card(for: live, in: layout)
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
+        .coordinateSpace(.named(Self.space))
         .motion(HomeWorkMapView.reflow, value: layout.motionKey)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: spotlight)
+        .animation(reduceMotion ? nil : Self.drop, value: phone)
+        .onChange(of: phone?.connected == true) { _, now in
+            if now && !reduceMotion { ripples += 1 }
+        }
         .onExitCommand { selected = nil }
         .onAppear {
             built = true
             onOpened()
         }
+    }
+
+    nonisolated private static let space = "orbit"
+    private static let drop = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.55)
+
+    private var phoneLink: OrbitPhoneLink? {
+        guard let share = mobileAccess.share else { return nil }
+        let open = mobileAccess.openSession
+        return OrbitPhoneLink(connected: share.isConnected, openSession: open,
+                              openTitle: open.flatMap { store.session($0)?.title })
+    }
+
+    // The pill for the code that is out, above the ring. The line from it always goes into
+    // the top of the ring; running one straight to a session would cross the pills between.
+    private func beacon(_ phone: OrbitPhoneLink, layout: OrbitLayout) -> some View {
+        // The second line gives way first when the pill would run past the map.
+        let reachWidth = min(280, max(80, layout.size.width - 140))
+        return OrbitPhoneBeacon(link: phone, reachWidth: reachWidth) {
+            MobilePairing.open(dialogs: dialogs)
+        }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Self.space)) } action: {
+            beaconFrame = $0
+        }
+        .frame(width: layout.size.width, height: OrbitPhoneBeacon.height)
+        .position(x: layout.hub.x, y: OrbitPhoneBeacon.height / 2 + 2)
+        .transition(.asymmetric(insertion: .offset(y: -14).combined(with: .opacity),
+                                removal: .offset(y: -12).combined(with: .opacity)))
     }
 
     // A part of the opening, or nothing when motion is reduced and the map simply appears.
@@ -561,11 +625,14 @@ private struct OrbitWires: View {
     // When each wire grows, for a map that builds itself up.
     var opening: OrbitOpening?
     var spotlight: OrbitSpotlight?
+    // The wires a connected phone reaches, drawn green over the rest.
+    var phoneLit: Set<String> = []
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let flowing = reduceMotion ? [] : wires.filter { $0.kind == .running }
+        let reached = wires.filter { phoneLit.contains($0.id) }
+        let flowing = reduceMotion ? [] : wires.filter { $0.kind == .running && !phoneLit.contains($0.id) }
         let lit = flowing.filter { OrbitSpotlight.opacity(spotlight, group: $0.group, session: $0.session) == 1 }
         let dim = flowing.filter { OrbitSpotlight.opacity(spotlight, group: $0.group, session: $0.session) < 1 }
         ZStack {
@@ -576,6 +643,17 @@ private struct OrbitWires: View {
                     .animation(reduceMotion ? nil : OrbitOpening.draw.speed(1.2).delay(opening?.wire(wire) ?? 0),
                                value: built)
                     .opacity(OrbitSpotlight.opacity(spotlight, group: wire.group, session: wire.session))
+            }
+            ForEach(reached) { wire in
+                wire.connector
+                    .trim(from: 0, to: built ? 1 : 0)
+                    .stroke(Theme.dotOn, style: StrokeStyle(lineWidth: Self.width(wire) + 0.6, lineCap: .round))
+                    .transition(.opacity)
+            }
+            if !reduceMotion && !reached.isEmpty {
+                FlowingWires(paths: [2.6: Self.path(reached)], colour: Theme.dotOn, dash: [5, 4], period: 0.8)
+                    .opacity(built ? 1 : 0)
+                    .transition(.opacity)
             }
             Group {
                 if !lit.isEmpty {
@@ -596,13 +674,15 @@ private struct OrbitWires: View {
     // One path for each line width, since a layer strokes every line it holds the same. The
     // moving dashes are a little heavier than the line they run along.
     static func paths(_ wires: [OrbitLayout.Wire]) -> [CGFloat: CGPath] {
-        Dictionary(grouping: wires, by: { width($0) + 0.6 }).mapValues { group in
-            let path = CGMutablePath()
-            for wire in group {
-                path.addPath(wire.connector.path(in: .zero).cgPath)
-            }
-            return path as CGPath
+        Dictionary(grouping: wires, by: { width($0) + 0.6 }).mapValues(path)
+    }
+
+    static func path(_ wires: [OrbitLayout.Wire]) -> CGPath {
+        let path = CGMutablePath()
+        for wire in wires {
+            path.addPath(wire.connector.path(in: .zero).cgPath)
         }
+        return path
     }
 
     static func colour(_ kind: OrbitLayout.Wire.Kind) -> Color {
@@ -884,6 +964,8 @@ private struct OrbitSessionPill: View {
     let selected: Bool
     let left: Bool
     let built: Bool
+    // A connected phone has this session open.
+    let onPhone: Bool
     let entrance: Animation?
     let action: () -> Void
     let point: (Bool) -> Void
@@ -906,11 +988,15 @@ private struct OrbitSessionPill: View {
                         .font(.system(size: 12, weight: needs ? .semibold : .medium))
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(live.session.agent.title)
-                        .font(.mono(10.5))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .fixedSize()
+                    if onPhone {
+                        OnPhoneTag().transition(.opacity)
+                    } else {
+                        Text(live.session.agent.title)
+                            .font(.mono(10.5))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
                 }
                 if needs {
                     request
@@ -925,6 +1011,9 @@ private struct OrbitSessionPill: View {
             .background {
                 shape.fill(Theme.card)
                 if needs { shape.fill(Theme.attention.opacity(0.09)) }
+            }
+            .background {
+                if onPhone && !needs { shape.stroke(Theme.dotOn.opacity(0.12), lineWidth: 6) }
             }
             .overlay(shape.stroke(border, lineWidth: selected || (needs && hovering) ? 1.5 : 1))
             .shadow(color: (needs ? Theme.attention : .black).opacity(needs ? 0.22 : 0.1), radius: 8, y: 5)
@@ -945,7 +1034,9 @@ private struct OrbitSessionPill: View {
             guard !reduceMotion else { return }
             if now { pings += 1 } else { settles += 1 }
         }
-        .accessibilityLabel("\(live.session.title), \(live.status), \(live.containerName)")
+        .motion(Motion.hover, value: onPhone)
+        .accessibilityLabel("\(live.session.title), \(live.status), \(live.containerName)"
+                            + (onPhone ? ", open on phone" : ""))
         .accessibilityHint("Shows this session's card")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -982,7 +1073,25 @@ private struct OrbitSessionPill: View {
             return selected || hovering ? Theme.attention : Theme.attention.opacity(0.55)
         }
         if selected { return Theme.accent }
+        if onPhone { return Theme.dotOn.opacity(0.45) }
         return hovering ? Theme.accent.opacity(0.45) : Theme.border
+    }
+}
+
+// Takes the place of the agent's name on a session a phone has open.
+private struct OnPhoneTag: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "iphone")
+                .font(.system(size: 9, weight: .semibold))
+            Text("On phone")
+                .font(.system(size: 10.5, weight: .semibold))
+        }
+        .foregroundStyle(Theme.addition)
+        .padding(.horizontal, 6)
+        .frame(height: 18)
+        .background(Capsule().fill(PhoneLink.connected.fill ?? .clear))
+        .fixedSize()
     }
 }
 

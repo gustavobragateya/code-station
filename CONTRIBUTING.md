@@ -82,7 +82,7 @@ Keep organisation-specific hostnames, client IDs, and repository URLs in that fi
 
 A project is a reference to a folder on disk. A workspace is a reusable group of projects with one lead project. When a session starts, it records its own project paths and worktree choices so later workspace edits do not change an existing conversation.
 
-`SessionRunner` owns agent connections, turn execution, and the prompt queue. `SessionComposerStore` keeps unsent drafts and prompt-history cursors. `AgentLaunchConfiguration` resolves settings once and supplies both command-line arguments and server parameters, so prompt text cannot be interpreted as an access setting. `AgentInstructions` holds the app guidance sent to agents.
+`SessionRunner` owns agent connections, turn execution, and the prompt queue. `SessionComposerStore` keeps unsent drafts and prompt-history cursors. `ReviewCommentStore` keeps the comments left on a session's changes until they are sent back as one prompt, and runs second opinions: a read-only `SecondOpinion` run of another agent whose findings arrive as more comments. `AgentLaunchConfiguration` resolves settings once and supplies both command-line arguments and server parameters, so prompt text cannot be interpreted as an access setting. `AgentInstructions` holds the app guidance sent to agents.
 
 The runner launches the selected agent in its own process group. Claude uses its streaming CLI protocol, Codex uses `app-server` JSON-RPC, and Copilot uses its headless server with Content-Length framing. The adapters normalize these protocols into shared `StreamEvent` values for the transcript and session state.
 
@@ -102,7 +102,7 @@ App-owned data lives under:
 ~/Library/Application Support/com.teya.code-station/
 ```
 
-This includes the project and session index, one transcript file per session, saved HTTP requests, shortcuts, temporary attachments, and the cached skills marketplace. Managed Git worktrees and their deletion queue live under `~/.code-station/`, which keeps tool working directories short and free of spaces. Small UI preferences use `UserDefaults`. OAuth client secrets and tokens use the macOS Keychain. Session logs live under `~/Library/Logs/com.teya.code-station`.
+This includes the project and session index, one transcript file per session, saved HTTP requests, shortcuts, temporary attachments, unsent review comments, and the cached skills marketplace. Managed Git worktrees and their deletion queue live under `~/.code-station/`, which keeps tool working directories short and free of spaces. Small UI preferences use `UserDefaults`. OAuth client secrets and tokens use the macOS Keychain. Session logs live under `~/Library/Logs/com.teya.code-station`.
 
 MCP definitions are read from and written to `~/.config/mcp/config.json`. The app uses those shared definitions when it registers a server in each coding agent's own configuration. Locally started MCP servers, shortcut commands, agent processes, and terminal shells are child processes owned by the app and are stopped when the app quits.
 

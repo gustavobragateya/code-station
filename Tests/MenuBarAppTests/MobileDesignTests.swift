@@ -130,9 +130,7 @@ struct MobileDesignPairingTests {
         let controller = MobileAccessController(store: store, runner: runner, gitStats: GitStatsCache())
         controller.setEnabled(true)
         defer { controller.stop() }
-        let share = try await controller.startSharing(.session(main.id))
-        // Keep the listener alive after this pairing is revoked to check its stale URL.
-        _ = try await controller.startSharing(.project(project.id))
+        let share = try await controller.startSharing()
         let components = try #require(URLComponents(url: share.url, resolvingAgainstBaseURL: false))
         let port = try #require(components.port)
         let secret = try #require(components.fragment?.split(separator: "=").last.map(String.init))
@@ -144,9 +142,14 @@ struct MobileDesignPairingTests {
         }
         defer { deadline.cancel(); socket.cancel(with: .normalClosure, reason: nil) }
         try await socket.send(.string(#"{"type":"authenticate","version":1,"secret":"\#(secret)"}"#))
+        let list = try await receive("directory", from: socket)
+        let projects = list["projects"] as? [[String: Any]] ?? []
+        let listed = Set(projects.flatMap { $0["sessions"] as? [[String: Any]] ?? [] }
+            .compactMap { $0["id"] as? String })
+        #expect(listed.isSuperset(of: [main.id.uuidString, other.id.uuidString]))
+        try await socket.send(.string(#"{"type":"openSession","sessionID":"\#(main.id)"}"#))
         let initial = try await receive("snapshot", from: socket)
         #expect(initial["conversation"] as? String == "main")
-        #expect(initial["scope"] as? String == "This session only")
         let design = try await receive("design", from: socket)
         let screens = try #require(design["screens"] as? [[String: String]])
         let path = try #require(screens.first?["url"])
@@ -155,7 +158,7 @@ struct MobileDesignPairingTests {
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(String(data: html, encoding: .utf8) == "<button>Preview</button>")
 
-        try await socket.send(.string(#"{"type":"openSession","sessionID":"\#(other.id)"}"#))
+        try await socket.send(.string(#"{"type":"openSession","sessionID":"\#(UUID())"}"#))
         let refused = try await receive("error", from: socket)
         #expect(refused["code"] as? String == "commandFailed")
         try await socket.send(.string(#"{"type":"openConversation","conversation":"design"}"#))
@@ -174,11 +177,11 @@ struct MobileDesignPairingTests {
                                                   atomically: true, encoding: .utf8)
         let updated = try await receive("design", from: socket)
         #expect(updated["revision"] as? String != design["revision"] as? String)
-        controller.revoke(.session(main.id))
+        controller.revoke()
         let ended = try await receive("error", from: socket)
         #expect(ended["code"] as? String == "pairingEnded")
-        let (_, revoked) = try await URLSession.shared.data(from: artifactURL)
-        #expect((revoked as? HTTPURLResponse)?.statusCode == 404)
+        let revoked = try? await URLSession.shared.data(from: artifactURL)
+        #expect((revoked?.1 as? HTTPURLResponse)?.statusCode != 200)
     }
 
     private func receive(_ type: String, from socket: URLSessionWebSocketTask) async throws -> [String: Any] {

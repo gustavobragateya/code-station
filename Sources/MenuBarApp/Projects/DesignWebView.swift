@@ -15,6 +15,11 @@ struct DesignWebView: View {
     let onSelection: (DesignElementSelection) -> Void
     let onSnapshot: (NSImage?, DesignSnapshotRequest) -> Void
     var onViewport: ((Double) -> Void)? = nil
+    // A second opinion's notes on this screen, drawn as pins on the spots they are about.
+    var pins: [DesignPin] = []
+    var hotPin: String? = nil
+    var onPin: ((String) -> Void)? = nil
+    var onPinHover: ((String?) -> Void)? = nil
 
     @State private var scale: CGFloat = 1
     @State private var fitGeneration = 0
@@ -27,7 +32,8 @@ struct DesignWebView: View {
                 selectionEnabled: selectionEnabled, snapshotRequest: snapshotRequest,
                 fitGeneration: fitGeneration,
                 onSelection: onSelection, onSnapshot: onSnapshot,
-                onViewport: onViewport, onScale: { scale = $0 })
+                onViewport: onViewport, onScale: { scale = $0 },
+                pins: pins, hotPin: hotPin, onPin: onPin, onPinHover: onPinHover)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             HStack(spacing: 10) {
                 Text("Scroll to zoom · Drag to pan")
@@ -80,6 +86,10 @@ struct DesignWebContent: NSViewRepresentable {
     // right whatever sits between the view's bounds and the layout viewport.
     var onViewport: ((Double) -> Void)? = nil
     var onScale: ((CGFloat) -> Void)? = nil
+    var pins: [DesignPin] = []
+    var hotPin: String? = nil
+    var onPin: ((String) -> Void)? = nil
+    var onPinHover: ((String?) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -118,6 +128,9 @@ struct DesignWebContent: NSViewRepresentable {
         context.coordinator.onSnapshot = onSnapshot
         context.coordinator.onViewport = onViewport
         context.coordinator.onScale = onScale
+        context.coordinator.onPin = onPin
+        context.coordinator.onPinHover = onPinHover
+        context.coordinator.setPins(pins, hot: hotPin, in: webView)
         context.coordinator.readAccessURL = readAccessURL
         context.coordinator.setSelection(selectionEnabled, in: webView)
         if context.coordinator.fitGeneration != fitGeneration {
@@ -171,6 +184,21 @@ struct DesignWebContent: NSViewRepresentable {
         var onSnapshot: ((NSImage?, DesignSnapshotRequest) -> Void)?
         var onViewport: ((Double) -> Void)?
         var onScale: ((CGFloat) -> Void)?
+        var onPin: ((String) -> Void)?
+        var onPinHover: ((String?) -> Void)?
+        // The pins as last sent to the page, so they are sent again only when they change
+        // and once more after every load.
+        var pinsScript = ""
+        var appliedPins = ""
+
+        func setPins(_ pins: [DesignPin], hot: String?, in webView: WKWebView) {
+            let list = (try? JSONEncoder().encode(pins)).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+            let hotValue = (try? JSONEncoder().encode(hot)).map { String(decoding: $0, as: UTF8.self) } ?? "null"
+            pinsScript = "window.__codeStationSetPins?.(\(list), \(hotValue));"
+            guard !navigationPending, appliedPins != pinsScript else { return }
+            appliedPins = pinsScript
+            webView.evaluateJavaScript(pinsScript)
+        }
 
         func setSelection(_ enabled: Bool, in webView: WKWebView) {
             guard selectionEnabled != enabled else { return }
@@ -186,8 +214,12 @@ struct DesignWebContent: NSViewRepresentable {
                     configuration.rect = clipped
                 }
             }
-            webView.takeSnapshot(with: configuration) { [weak self] image, _ in
-                self?.onSnapshot?(image, request)
+            // Pins belong to the review, not the design, so no picture of the design has them.
+            webView.evaluateJavaScript("window.__codeStationHidePins?.(true);") { _, _ in
+                webView.takeSnapshot(with: configuration) { [weak self] image, _ in
+                    webView.evaluateJavaScript("window.__codeStationHidePins?.(false);")
+                    self?.onSnapshot?(image, request)
+                }
             }
         }
 
@@ -216,6 +248,14 @@ struct DesignWebContent: NSViewRepresentable {
                 viewport?.fit()
                 return
             }
+            if body["kind"] as? String == "pin" {
+                if let id = body["id"] as? String { onPin?(id) }
+                return
+            }
+            if body["kind"] as? String == "pinHover" {
+                onPinHover?(body["id"] as? String)
+                return
+            }
 
             guard let selector = body["selector"] as? String,
                   let tag = body["tag"] as? String,
@@ -233,9 +273,10 @@ struct DesignWebContent: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             navigationPending = false
+            appliedPins = pinsScript
             webView.evaluateJavaScript(
                 "window.__codeStationSetSelection?.(\(selectionEnabled)); "
-                    + "window.__codeStationReportViewport?.();")
+                    + "window.__codeStationReportViewport?.(); " + pinsScript)
         }
 
         func webView(_ webView: WKWebView,
@@ -458,6 +499,81 @@ struct DesignWebContent: NSViewRepresentable {
         window.webkit.messageHandlers.codeStationDesignSelection.postMessage({kind: "fit"});
       }, true);
 
+      // A second opinion's pins, in a layer of their own above the design. Each sits on the
+      // element its note names, or on the box the reviewer drew, and follows the page as
+      // it lays out again. They are buttons named by their note, so they can be reached
+      // and read like any other control.
+      var pins = [];
+      var hotPin = null;
+      var pinsHidden = false;
+      var pinLayer = null;
+      const pinColours = {must: "#b3412e", should: "#b77a12", look: "#6b6b6b"};
+      function post(message) {
+        window.webkit.messageHandlers.codeStationDesignSelection.postMessage(message);
+      }
+      function pinRect(pin) {
+        if (pin.selector) {
+          try {
+            const element = document.querySelector(pin.selector);
+            if (element) {
+              const rect = element.getBoundingClientRect();
+              return {x: rect.left + window.scrollX, y: rect.top + window.scrollY, w: rect.width, h: rect.height};
+            }
+          } catch (error) {}
+        }
+        if (pin.box) return {x: pin.box.x, y: pin.box.y, w: pin.box.width, h: pin.box.height};
+        return null;
+      }
+      function drawPins() {
+        if (!pinLayer) {
+          pinLayer = document.createElement("div");
+          pinLayer.setAttribute("data-code-station-pins", "");
+          Object.assign(pinLayer.style, {position: "absolute", left: "0", top: "0", width: "0", height: "0",
+            zIndex: "2147483647", pointerEvents: "none"});
+        }
+        if (!pinLayer.isConnected) document.documentElement.appendChild(pinLayer);
+        pinLayer.replaceChildren();
+        pinLayer.style.display = pinsHidden ? "none" : "";
+        for (const pin of pins) {
+          const rect = pinRect(pin);
+          if (!rect) continue;
+          const colour = pinColours[pin.severity] || pinColours.look;
+          const hot = pin.id === hotPin;
+          const outline = document.createElement("div");
+          Object.assign(outline.style, {position: "absolute", left: `${rect.x - 4}px`, top: `${rect.y - 3}px`,
+            width: `${rect.w + 8}px`, height: `${rect.h + 6}px`, boxSizing: "border-box", borderRadius: "6px",
+            border: `2px ${hot ? "solid" : "dashed"} ${colour}`, background: hot ? `${colour}22` : "transparent",
+            opacity: hot ? "1" : "0.7", pointerEvents: "none"});
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = String(pin.number);
+          button.title = pin.label;
+          button.setAttribute("aria-label", pin.label);
+          Object.assign(button.style, {position: "absolute", left: `${rect.x + rect.w - 11}px`, top: `${rect.y - 11}px`,
+            width: "22px", height: "22px", borderRadius: "11px", border: "2px solid #fff", background: colour,
+            color: "#fff", font: "600 11px -apple-system, system-ui, sans-serif", padding: "0", margin: "0",
+            cursor: "pointer", pointerEvents: "auto", boxShadow: hot ? `0 0 0 3px ${colour}55` : "0 1px 3px rgba(0,0,0,.3)"});
+          button.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            post({kind: "pin", id: pin.id});
+          }, true);
+          button.addEventListener("mouseenter", () => post({kind: "pinHover", id: pin.id}));
+          button.addEventListener("mouseleave", () => post({kind: "pinHover", id: null}));
+          pinLayer.append(outline, button);
+        }
+      }
+      window.__codeStationSetPins = (list, hot) => {
+        pins = Array.isArray(list) ? list : [];
+        hotPin = hot || null;
+        drawPins();
+      };
+      window.__codeStationHidePins = hidden => {
+        pinsHidden = Boolean(hidden);
+        if (pinLayer) pinLayer.style.display = pinsHidden ? "none" : "";
+      };
+      new ResizeObserver(() => { if (pins.length) drawPins(); }).observe(document.documentElement);
+
       window.__codeStationSetSelection = value => {
         stopDrag();
         enabled = Boolean(value);
@@ -466,11 +582,11 @@ struct DesignWebContent: NSViewRepresentable {
       };
 
       document.addEventListener("mouseover", event => {
-        if (enabled) highlight(event.target);
+        if (enabled && !event.target.closest?.("[data-code-station-pins]")) highlight(event.target);
       }, true);
 
       document.addEventListener("click", event => {
-        if (!enabled) return;
+        if (!enabled || event.target.closest?.("[data-code-station-pins]")) return;
         event.preventDefault();
         event.stopImmediatePropagation();
         const element = event.target;
@@ -484,4 +600,14 @@ struct DesignWebContent: NSViewRepresentable {
       }, true);
     })();
     """#
+}
+
+// One note's pin on the canvas: where it goes and how it reads.
+struct DesignPin: Encodable, Equatable {
+    let id: String
+    var selector: String?
+    var box: DesignSecondOpinion.Box?
+    let severity: String
+    let number: Int
+    let label: String
 }

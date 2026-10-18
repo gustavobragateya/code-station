@@ -646,6 +646,9 @@ struct TurnEnding: Equatable, Sendable {
     let started: Date
     let ended: Date
     let outcome: Outcome
+    // The commit each working directory had checked out when the turn began, so the
+    // turn's own commits can be told apart from the ones before it.
+    var startHeads: [String: String] = [:]
 
     var duration: TimeInterval { max(0, ended.timeIntervalSince(started)) }
 

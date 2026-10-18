@@ -26,6 +26,19 @@ struct DiffTextView: NSViewRepresentable {
     // Grow to the height of the whole diff instead of scrolling it, for a diff that sits
     // in a page with others and scrolls along with that page.
     var fitsContent = false
+    // A press on a line number, named by DiffAnchor key, and whether shift was held to
+    // stretch the comment being written over to it. Nil where the diff takes no comments.
+    var onLine: ((String, Bool) -> Void)?
+    // A drag down the numbers from one line to another, named by their keys.
+    var onRange: ((String, String) -> Void)?
+    // The lines the comment being written is about, drawn picked out.
+    var picked: Set<String> = []
+    // What hangs under a line, keyed by the line's id: the review comments placed there
+    // and the comment being written about it. The text keeps an empty row under each of
+    // those lines, built with DiffComments, and the view sits on that row.
+    var threads: [Int: AnyView] = [:]
+    // The thread to bring on screen. A new serial asks again for the same one.
+    var reveal: DiffReveal?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -72,14 +85,33 @@ struct DiffTextView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? DiffDocumentView else { return }
         textView.onExpand = onExpand
+        textView.onLine = onLine
+        textView.onRange = onRange
+        if textView.picked != picked {
+            textView.picked = picked
+            textView.needsDisplay = true
+        }
+        textView.syncThreads(threads, environment: context.environment)
         // The string is built once per loaded diff, so identity is enough to tell the
         // same document from a newly opened file.
-        guard context.coordinator.shown !== text else { return }
+        defer {
+            if let reveal, reveal != context.coordinator.revealed, textView.reveal(thread: reveal.line) {
+                context.coordinator.revealed = reveal
+            }
+        }
+        guard context.coordinator.shown !== text else {
+            textView.layoutThreads()
+            return
+        }
         context.coordinator.shown = text
         let heightBefore = textView.frame.height
         let origin = scrollView.contentView.bounds.origin
         textView.textStorage?.setAttributedString(text)
         textView.sizeToFit()
+        textView.layoutThreads()
+        // The text system only repaints where glyphs changed, but a row's band starts in
+        // the margin left of them, so rows that moved would keep stale margins.
+        textView.needsDisplay = true
         switch scroll {
         case .top:
             scrollView.contentView.scroll(to: .zero)
@@ -100,6 +132,7 @@ struct DiffTextView: NSViewRepresentable {
 
     final class Coordinator {
         var shown: NSAttributedString?
+        var revealed: DiffReveal?
     }
 }
 
@@ -122,10 +155,18 @@ private final class DiffScrollView: NSScrollView {
 // attribute and is painted here across the whole line fragment.
 private final class DiffDocumentView: NSTextView {
     var onExpand: ((String, DiffExpandDirection) -> Void)?
+    var onLine: ((String, Bool) -> Void)?
+    var onRange: ((String, String) -> Void)?
+    var picked: Set<String> = []
+    // The lines a drag down the numbers covers while the button is still held.
+    private var dragged: Set<String> = []
     // The gap row under the pointer, which is drawn a shade stronger so it reads as
     // something to press.
     private var hovered: String?
+    // The line number under the pointer, in a diff that takes comments.
+    private var hoveredRow: DiffRowHit?
     private var hoverTracking: NSTrackingArea?
+    private var threadHosts: [Int: NSHostingController<AnyView>] = [:]
 
     // Grow with the text, but never sit narrower than the pane, so the bands reach the
     // right edge even when every line is short.
@@ -142,11 +183,124 @@ private final class DiffDocumentView: NSTextView {
                                                   object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(paneResized),
                                                name: NSView.frameDidChangeNotification, object: clip)
+        clip.postsBoundsChangedNotifications = true
+        NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification,
+                                                  object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(paneScrolled),
+                                               name: NSView.boundsDidChangeNotification, object: clip)
     }
 
     // sizeToFit measures from the layout again, so a shrunk pane also lets go of any
     // width the text never needed.
-    @objc private func paneResized() { sizeToFit() }
+    @objc private func paneResized() {
+        sizeToFit()
+        layoutThreads()
+    }
+
+    // The code scrolls sideways under the cards, which stay where they can be read.
+    @objc private func paneScrolled() {
+        guard !threadHosts.isEmpty else { return }
+        placeThreads()
+    }
+
+    // MARK: - Threads
+
+    func syncThreads(_ threads: [Int: AnyView], environment: EnvironmentValues) {
+        for (id, host) in threadHosts where threads[id] == nil {
+            host.view.removeFromSuperview()
+            threadHosts[id] = nil
+        }
+        for (id, view) in threads {
+            // Hosted apart from the window's own SwiftUI tree, so it is handed everything
+            // the diff itself can see: the palette, the dialogs, the reading size.
+            let root = AnyView(view.environment(\.self, environment))
+            if let host = threadHosts[id] {
+                host.rootView = root
+            } else {
+                let host = NSHostingController(rootView: root)
+                host.sizingOptions = []
+                host.view.isHidden = true
+                addSubview(host.view)
+                threadHosts[id] = host
+            }
+        }
+    }
+
+    // How far in the cards start: past the line numbers, so they read as hanging from
+    // the code rather than from the margin.
+    private var threadIndent: CGFloat {
+        let font = textStorage.flatMap { $0.length > 0 ? $0.attribute(.font, at: 0, effectiveRange: nil) as? NSFont : nil }
+            ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        return textContainerInset.width + font.maximumAdvancement.width * 14
+    }
+
+    private var threadWidth: CGFloat {
+        let clip = enclosingScrollView?.contentView.bounds ?? visibleRect
+        return max(280, min(760, clip.width - threadIndent - 20))
+    }
+
+    // Each card is measured at the width it gets, and the empty row under its line grows
+    // to fit it, so the code below moves down to make room rather than being covered.
+    func layoutThreads() {
+        guard let storage = textStorage, storage.length > 0 else {
+            threadHosts.values.forEach { $0.view.isHidden = true }
+            return
+        }
+        let width = threadWidth
+        var heights: [(NSRange, CGFloat)] = []
+        storage.enumerateAttribute(.diffThread, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+            guard let key = value as? String, let id = Int(key), let host = threadHosts[id] else { return }
+            let height = ceil(host.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude)).height) + 12
+            let style = storage.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle
+            if abs((style?.minimumLineHeight ?? 0) - height) > 0.5 { heights.append((range, height)) }
+        }
+        if !heights.isEmpty {
+            storage.beginEditing()
+            for (range, height) in heights {
+                storage.addAttribute(.paragraphStyle, value: DiffText.threadRowStyle(height: height), range: range)
+            }
+            storage.endEditing()
+            sizeToFit()
+        }
+        placeThreads()
+    }
+
+    private func placeThreads() {
+        guard let storage = textStorage, let layoutManager else { return }
+        let clip = enclosingScrollView?.contentView.bounds ?? visibleRect
+        let origin = textContainerOrigin
+        let width = threadWidth
+        var placed: Set<Int> = []
+        if storage.length > 0 {
+            storage.enumerateAttribute(.diffThread, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+                guard let key = value as? String, let id = Int(key), let host = threadHosts[id] else { return }
+                let glyph = layoutManager.glyphIndexForCharacter(at: range.location)
+                let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+                host.view.frame = NSRect(x: clip.minX + threadIndent, y: fragment.minY + origin.y + 6,
+                                         width: width, height: max(0, fragment.height - 12))
+                host.view.isHidden = false
+                placed.insert(id)
+            }
+        }
+        // A card whose row is not in the text yet waits out of sight until the text that
+        // makes room for it lands.
+        for (id, host) in threadHosts where !placed.contains(id) { host.view.isHidden = true }
+    }
+
+    // Scrolls a placed thread into the middle of the pane. False while it has no row yet.
+    func reveal(thread id: Int) -> Bool {
+        guard let host = threadHosts[id], !host.view.isHidden else { return false }
+        let visible = enclosingScrollView?.contentView.bounds.height ?? visibleRect.height
+        let frame = host.view.frame
+        let target = NSRect(x: frame.minX, y: frame.midY - visible / 2, width: 1, height: visible)
+        scrollToVisible(target.intersection(bounds).isEmpty ? frame : target.intersection(bounds))
+        return true
+    }
+
+    private func overThread(_ event: NSEvent) -> Bool {
+        let point = convert(event.locationInWindow, from: nil)
+        return threadHosts.values.contains { !$0.view.isHidden && $0.view.frame.contains(point) }
+    }
 
     // MARK: - Opening a gap
 
@@ -162,37 +316,99 @@ private final class DiffDocumentView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        // A held modifier means the click is about the selection, not the row.
-        let plain = event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+        // A held modifier means the click is about the selection, not the row. Shift is
+        // the one exception on a line number, where it stretches a comment over lines.
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let plain = flags.isEmpty
         if plain, let onExpand, let target = target(at: event), let direction = target.direction {
             onExpand(target.key, direction)
+            return
+        }
+        if plain || flags == .shift, let onLine, let row = row(at: event) {
+            if flags == .shift {
+                onLine(row.key, true)
+            } else {
+                trackRange(from: row.key)
+            }
             return
         }
         super.mouseDown(with: event)
     }
 
+    // Holding the button down on a number and dragging down the others picks every line
+    // in between, the way a range is picked on a pull request. Letting go on the line it
+    // started from is a plain click.
+    private func trackRange(from start: String) {
+        let side = DiffComments.anchor(start)?.side
+        var end = start
+        dragged = [start]
+        needsDisplay = true
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp { break }
+            autoscroll(with: next)
+            if let hit = row(at: next), DiffComments.anchor(hit.key)?.side == side, hit.key != end {
+                end = hit.key
+                if let first = DiffComments.anchor(start), let last = DiffComments.anchor(end) {
+                    dragged = DiffComments.keys(first.extended(to: last))
+                }
+                needsDisplay = true
+            }
+        }
+        dragged = []
+        needsDisplay = true
+        if end != start, let onRange {
+            onRange(start, end)
+        } else {
+            onLine?(start, false)
+        }
+    }
+
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        if overThread(event) {
+            NSCursor.arrow.set()
+            if hoveredRow != nil || hovered != nil {
+                hoveredRow = nil
+                hovered = nil
+                needsDisplay = true
+            }
+            return
+        }
         let target = target(at: event)
-        if target?.direction != nil { NSCursor.pointingHand.set() }
-        guard target?.key != hovered else { return }
+        let row = row(at: event)
+        if target?.direction != nil || row != nil { NSCursor.pointingHand.set() }
+        guard target?.key != hovered || row != hoveredRow else { return }
         hovered = target?.key
+        hoveredRow = row
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        guard hovered != nil else { return }
+        guard hovered != nil || hoveredRow != nil else { return }
         hovered = nil
+        hoveredRow = nil
         needsDisplay = true
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        if target(at: event)?.direction != nil {
+        if overThread(event) {
+            NSCursor.arrow.set()
+        } else if target(at: event)?.direction != nil || row(at: event) != nil {
             NSCursor.pointingHand.set()
         } else {
             super.cursorUpdate(with: event)
         }
+    }
+
+    private func row(at event: NSEvent) -> DiffRowHit? {
+        guard onLine != nil,
+              let layoutManager, let textContainer, let storage = textStorage else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        let origin = textContainerOrigin
+        return DiffRowHit.at(NSPoint(x: point.x - origin.x, y: point.y - origin.y),
+                             layoutManager: layoutManager, container: textContainer,
+                             storage: storage)
     }
 
     private func target(at event: NSEvent) -> DiffGapHit? {
@@ -232,6 +448,67 @@ private final class DiffDocumentView: NSTextView {
             NSRect(x: 0, y: fragment.minY + origin.y,
                    width: self.bounds.width, height: fragment.height).fill()
         }
+        drawLineMarks(in: rect, layoutManager: layoutManager, container: textContainer, storage: storage)
+    }
+
+    // The lines a comment is being written about wear the accent across the row, and the
+    // number under the pointer turns into a plus so it reads as the place to start one.
+    private func drawLineMarks(in rect: NSRect, layoutManager: NSLayoutManager,
+                               container: NSTextContainer, storage: NSTextStorage) {
+        let picked = self.picked.union(dragged)
+        guard onLine != nil, !picked.isEmpty || hoveredRow != nil else { return }
+        let origin = textContainerOrigin
+        let glyphs = layoutManager.glyphRange(forBoundingRect: rect.offsetBy(dx: -origin.x, dy: -origin.y),
+                                              in: container)
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { fragment, _, _, lineGlyphs, _ in
+            let index = layoutManager.characterIndexForGlyph(at: lineGlyphs.location)
+            var numberRange = NSRange()
+            guard index < storage.length,
+                  let key = storage.attribute(.diffLineAnchor, at: index,
+                                              effectiveRange: &numberRange) as? String else { return }
+            if picked.contains(key) {
+                Theme.accentNSColor.withAlphaComponent(0.16).setFill()
+                NSRect(x: 0, y: fragment.minY + origin.y,
+                       width: self.bounds.width, height: fragment.height).fill()
+            }
+            guard self.hoveredRow == DiffRowHit(key: key) else { return }
+            let numbers = layoutManager.boundingRect(
+                forGlyphRange: layoutManager.glyphRange(forCharacterRange: numberRange, actualCharacterRange: nil),
+                in: container).offsetBy(dx: origin.x, dy: origin.y)
+            let badge = NSRect(x: numbers.minX, y: fragment.minY + origin.y + 1,
+                               width: numbers.width - 6, height: fragment.height - 2)
+            Theme.accentNSColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 4, yRadius: 4).fill()
+            let font = storage.attribute(.font, at: index, effectiveRange: nil) as? NSFont
+                ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+            let plus = NSAttributedString(string: "+", attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold),
+                .foregroundColor: Theme.accentNSColor
+            ])
+            let size = plus.size()
+            plus.draw(at: NSPoint(x: badge.minX + 5, y: badge.midY - size.height / 2))
+        }
+    }
+}
+
+// The line number a point in a diff that takes comments lands on, to start a comment
+// from. A number only answers over its own characters.
+struct DiffRowHit: Equatable {
+    var key: String
+
+    // The point is in text container coordinates.
+    static func at(_ point: NSPoint, layoutManager: NSLayoutManager,
+                   container: NSTextContainer, storage: NSTextStorage) -> DiffRowHit? {
+        guard storage.length > 0, point.x >= 0, point.y >= 0 else { return nil }
+        let index = layoutManager.characterIndex(for: point, in: container,
+                                                 fractionOfDistanceBetweenInsertionPoints: nil)
+        guard index < storage.length else { return nil }
+        let glyph = layoutManager.glyphIndexForCharacter(at: index)
+        let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        guard point.y >= fragment.minY, point.y < fragment.maxY,
+              let key = storage.attribute(.diffLineAnchor, at: index, effectiveRange: nil) as? String
+        else { return nil }
+        return DiffRowHit(key: key)
     }
 }
 
@@ -269,9 +546,11 @@ enum DiffText {
     // Lining up and colouring a long diff takes long enough to stall the window, so it is
     // built away from the main thread.
     static func build(_ lines: [DiffLine], language: CodeLanguage? = nil,
-                      scale: CGFloat = 1, numbered: Bool = false) async -> NSAttributedString {
+                      scale: CGFloat = 1, numbered: Bool = false,
+                      comments: DiffComments? = nil) async -> NSAttributedString {
         await Task.detached(priority: .userInitiated) {
-            Finished(text: attributed(lines, language: language, scale: scale, numbered: numbered))
+            Finished(text: attributed(lines, language: language, scale: scale, numbered: numbered,
+                                      comments: comments))
         }.value.text
     }
 
@@ -283,7 +562,8 @@ enum DiffText {
 
     static func attributed(_ lines: [DiffLine],
                            language: CodeLanguage? = nil,
-                           scale: CGFloat = 1, numbered: Bool = false) -> NSAttributedString {
+                           scale: CGFloat = 1, numbered: Bool = false,
+                           comments: DiffComments? = nil) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: 11 * scale, weight: .regular)
         // Colouring is for a diff a person reads; a huge one is scrolled, not read, and
         // plain text is much cheaper to build.
@@ -334,6 +614,13 @@ enum DiffText {
                     + String(repeating: " ", count: max(0, 5 - new.count)) + new + "  "
                 var numberAttributes = attributes
                 numberAttributes[.foregroundColor] = NSColor.secondaryLabelColor
+                // In a diff that takes comments the numbers are where one starts.
+                if comments != nil {
+                    let anchor = line.kind == .deletion
+                        ? pair?.0.map { DiffAnchor(side: .old, line: $0) }
+                        : pair?.1.map { DiffAnchor(side: .new, line: $0) }
+                    if let anchor { numberAttributes[.diffLineAnchor] = DiffComments.key(anchor) }
+                }
                 result.append(NSAttributedString(string: prefix, attributes: numberAttributes))
             }
             if let gap = line.gap {
@@ -343,11 +630,33 @@ enum DiffText {
             } else {
                 result.append(NSAttributedString(string: line.text, attributes: attributes))
             }
+            if comments?.threads.contains(line.id) == true {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+                result.append(threadRow(line.id, font: font))
+            }
             if index < lines.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: attributes))
             }
         }
         return result
+    }
+
+    // The empty row a thread's cards sit on. It starts at a guess and the view grows it
+    // to the cards' real height once they have been measured.
+    private static func threadRow(_ id: Int, font: NSFont) -> NSAttributedString {
+        NSAttributedString(string: " ", attributes: [
+            .font: font,
+            .diffThread: String(id),
+            .diffRowBackground: NSColor(Theme.field),
+            .paragraphStyle: threadRowStyle(height: 56)
+        ])
+    }
+
+    static func threadRowStyle(height: CGFloat) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = height
+        style.maximumLineHeight = height
+        return style
     }
 
     // What a gap row offers. A gap too long to open in one go opens from either end, so
@@ -444,4 +753,41 @@ extension NSAttributedString.Key {
     // Marks one control on such a row, holding the DiffExpandDirection it opens. Only
     // characters carrying it answer a press.
     static let diffGapAction = NSAttributedString.Key("codeStationDiffGapAction")
+
+    // Marks a line's numbers in a diff that takes comments, holding DiffComments.key of
+    // the line they number.
+    static let diffLineAnchor = NSAttributedString.Key("codeStationDiffLineAnchor")
+
+    // Marks the empty row a thread of review comments sits on, holding the id of the
+    // diff line the thread hangs from.
+    static let diffThread = NSAttributedString.Key("codeStationDiffThread")
+}
+
+// A request to bring a thread on screen, by the diff line it hangs from.
+struct DiffReveal: Equatable {
+    var line: Int
+    var serial: Int
+}
+
+// Where a diff that takes comments keeps room for them. It is handed to the builder off
+// the main thread, so it carries only the ids of the lines a thread hangs from; the cards
+// themselves are views laid over those rows.
+struct DiffComments: Sendable, Equatable {
+    var threads: Set<Int> = []
+
+    static func key(_ anchor: DiffAnchor) -> String { "\(anchor.side.rawValue):\(anchor.line)" }
+
+    static func anchor(_ key: String) -> DiffAnchor? {
+        let parts = key.split(separator: ":")
+        guard parts.count == 2, let side = ReviewSide(rawValue: String(parts[0])),
+              let line = Int(parts[1]) else { return nil }
+        return DiffAnchor(side: side, line: line)
+    }
+
+    // Every line a run covers, for drawing the run picked out.
+    static func keys(_ anchor: DiffAnchor) -> Set<String> {
+        Set((anchor.line...(anchor.lastLine ?? anchor.line)).map {
+            key(DiffAnchor(side: anchor.side, line: $0))
+        })
+    }
 }

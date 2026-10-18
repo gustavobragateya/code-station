@@ -54,6 +54,10 @@ struct Dialog: Identifiable {
     var width: CGFloat = 340
     var impact: Impact?
     var isModal = false
+    // The content draws the whole card, its title and buttons included, for a dialog
+    // whose header or footer follows what happens inside it. The title is still what a
+    // screen reader hears.
+    var framesItself = false
 }
 
 extension Dialog {
@@ -150,6 +154,14 @@ struct DialogHost: View {
                                 .frame(width: min(dialog.width, max(0, geometry.size.width - 32)))
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
+                    } else if dialog.framesItself, let content = dialog.content {
+                        content
+                            .frame(width: dialog.width)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .floatingCard(cornerRadius: 14)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityAddTraits(.isModal)
+                            .accessibilityLabel(dialog.title)
                     } else {
                         card(dialog)
                             .frame(width: dialog.width)

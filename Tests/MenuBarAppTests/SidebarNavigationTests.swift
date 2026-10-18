@@ -58,7 +58,7 @@ struct SidebarNavigationTests {
         await harness.settle()
         try harness.snapshot("expanded-dark")
 
-        try harness.click(x: 100, yFromTop: 179)
+        try harness.click(x: 100, yFromTop: 194)
         await harness.settle()
         #expect(harness.store.selection == nil)
         #expect(harness.store.selectedProjectID == project.id)

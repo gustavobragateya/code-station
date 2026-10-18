@@ -138,6 +138,7 @@ struct AppSidebar: View {
     // MARK: - Heading
 
     private var heading: some View {
+        @Bindable var settings = appSettings
         // Both rows read the same list, so it is worked out once for the pair rather than
         // built and sorted twice on every redraw of the rail.
         let notices = sessionNotices
@@ -145,8 +146,7 @@ struct AppSidebar: View {
         return VStack(alignment: .leading, spacing: 0) {
             SidebarBrandBar(runningCount: notices.count { $0.notice == .running },
                             isHome: store.selection == .home,
-                            selectHome: store.selectHome,
-                            noticeMenu: { sessionNoticeMenu })
+                            selectHome: store.selectHome)
             if !waiting.isEmpty {
                 SidebarNeedsYouStack(waiting: waiting, open: openNoticedSession)
                     .transition(.opacity)
@@ -154,53 +154,14 @@ struct AppSidebar: View {
             SidebarFilterBar(box: $filterBox, focused: $filterFocused,
                              openCommandPalette: commandPalette.open,
                              showsShortcutHint: !paneOwnsFindShortcut)
-            arrangementBar
+            SidebarArrangementBar(sort: $settings.projectSort, grouping: $settings.projectGrouping)
         }
         .animation(reduceMotion ? nil : .timingCurve(0.2, 0.8, 0.2, 1, duration: 0.4),
                    value: waiting.isEmpty)
     }
 
-    // The order and the grouping both decide the shape of the whole rail under them, so
-    // they share one line above the list in the open rather than hiding behind a menu.
-    private var arrangementBar: some View {
-        HStack(spacing: 6) {
-            HStack(spacing: 2) {
-                ForEach(ProjectSort.allCases) { option in
-                    ArrangementChip(title: option.label,
-                                    hint: option.hint,
-                                    selected: appSettings.projectSort == option) {
-                        appSettings.projectSort = option
-                    }
-                }
-            }
-            .padding(2)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Theme.field))
-
-            Spacer(minLength: 6)
-
-            HStack(spacing: 2) {
-                ForEach(ProjectGrouping.allCases) { option in
-                    ArrangementChip(title: option.label,
-                                    hint: option.hint,
-                                    selected: appSettings.projectGrouping == option) {
-                        appSettings.projectGrouping = option
-                    }
-                }
-            }
-            .padding(2)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Theme.field))
-        }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 10)
-    }
-
     private var sessionNotices: [NoticedSession] {
         SidebarNotices.all(store: store, runner: runner)
-    }
-
-    private var sessionNoticeMenu: [MenuEntry] {
-        SidebarNotices.menu(sessionNotices, store: store,
-                            isSelected: isSelected, open: openNoticedSession)
     }
 
     private func openNoticedSession(_ session: ChatSession) {
@@ -631,16 +592,17 @@ struct AppSidebar: View {
             let live = LiveConversation.of(session.id, store: store, runner: runner)
                 ?? session
             let state = runner.state(live.id)
+            let busy = state.isBusy || runner.isAskingSecondOpinion(session.id)
             SidebarRailRow(colour: tint.colour, selectedColour: Theme.accent,
                            selected: selected, pinned: session.isPinned,
-                           thread: ThreadPhase(busy: state.isBusy,
+                           thread: ThreadPhase(busy: busy,
                                                failed: state.isFailed,
                                                finished: store.isUnread(session.id)),
                            threadEndedCleanly: runner.lastTurnEnding(live.id)?.outcome == .finished) {
                 SessionCard(session: session,
                             worktrees: store.worktreeCoverage(for: session),
                             selected: selected,
-                            busy: state.isBusy,
+                            busy: busy,
                             failed: state.isFailed,
                             waiting: state == .waiting,
                             waitIsStale: runner.waitIsStale(live.id),
@@ -716,7 +678,7 @@ struct AppSidebar: View {
         sessions.count { session in
             let live = LiveConversation.of(session.id, store: store, runner: runner) ?? session
             let state = runner.state(live.id)
-            return SessionTone(busy: state.isBusy,
+            return SessionTone(busy: state.isBusy || runner.isAskingSecondOpinion(session.id),
                                needsInput: runner.question(live.id) != nil,
                                finished: store.isUnread(session.id),
                                waiting: state == .waiting,
@@ -1360,17 +1322,18 @@ private struct SidebarFocusRing: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .focused($focused)
-            .focusEffectDisabled()
-            .overlay(RoundedRectangle(cornerRadius: 6)
-                .stroke(focused ? Theme.accent : .clear, lineWidth: 2)
-                .padding(-2)
-                .allowsHitTesting(false))
+            .sidebarFocusRing($focused)
     }
 }
 
-private extension View {
+extension View {
     func sidebarFocusRing() -> some View { modifier(SidebarFocusRing()) }
+
+    func sidebarFocusRing(_ focused: FocusState<Bool>.Binding) -> some View {
+        self.focused(focused)
+            .focusEffectDisabled()
+            .overlay(FocusRingStroke(focused: focused.wrappedValue))
+    }
 }
 
 // The square that closes the footer row. Everything the app can be set up with lives
@@ -1394,32 +1357,6 @@ private struct SettingsButton: View {
             .hoverLift(hovering, amount: Motion.smallLift)
             .onHover { hovering = $0 }
             .accessibilityLabel("Tools and settings")
-    }
-}
-
-// Each pair sits on a shared track and the chosen option is lifted out of it, so which is
-// on reads from the shape alone without having to read the words.
-private struct ArrangementChip: View {
-    let title: String
-    let hint: String
-    let selected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(title.uppercased())
-                .font(.mono(9.5, .semibold))
-                .kerning(0.6)
-                .foregroundStyle(selected ? AnyShapeStyle(Color.primary) : AnyShapeStyle(.secondary))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(RoundedRectangle(cornerRadius: 5)
-                    .fill(selected ? Theme.card : Color.clear))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .hoverLift()
-        .appTooltip(hint)
     }
 }
 

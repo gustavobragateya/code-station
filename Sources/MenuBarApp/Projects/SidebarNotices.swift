@@ -1,8 +1,7 @@
 import SwiftUI
 
 // A session worth naming above the tree, and the few words that say why. The same list
-// feeds the NEEDS YOU card and the running count's menu, so the sidebar works it out once
-// for the pair rather than building and sorting it twice on every redraw.
+// feeds the NEEDS YOU card and the running count.
 struct NoticedSession {
     let session: ChatSession
     let project: Project
@@ -23,7 +22,7 @@ enum SidebarNotices {
             let live = LiveConversation.id(of: session.id, store: store, runner: runner)
             let question = runner.question(live)
             guard let notice = SessionNotice(
-                isBusy: runner.state(live).isBusy,
+                isBusy: runner.state(live).isBusy || runner.isAskingSecondOpinion(session.id),
                 needsInput: question != nil,
                 finishedUnseen: store.hasFinished(session.id)) else { return nil }
             return NoticedSession(session: session, project: project, notice: notice,
@@ -53,109 +52,123 @@ enum SidebarNotices {
             return "finished while away"
         }
     }
-
-    // The menu behind the running count. The list is already grouped by kind, so a rule
-    // between two neighbours of different kinds is all the separation it needs.
-    static func menu(_ notices: [NoticedSession], store: ProjectStore,
-                     isSelected: (ChatSession) -> Bool,
-                     open: @escaping (ChatSession) -> Void) -> [MenuEntry] {
-        var entries: [MenuEntry] = []
-        for (index, noticed) in notices.enumerated() {
-            if index > 0, notices[index - 1].notice != noticed.notice {
-                entries.append(.separator)
-            }
-            entries.append(.item(
-                noticed.session.title,
-                checked: isSelected(noticed.session),
-                badge: noticed.notice.badge,
-                badgeTint: noticed.notice.tint,
-                subtitle: noticed.session.workspaceID.flatMap(store.workspace)?.name
-                    ?? noticed.project.name,
-                detail: RelativeTime.short(noticed.session.lastActivity)) {
-                    open(noticed.session)
-                })
-        }
-        return entries
-    }
-}
-
-extension SessionNotice {
-    var badge: String {
-        switch self {
-        case .needsInput: "INPUT"
-        case .running: "RUNNING"
-        case .finished: "FINISHED"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .running: Theme.addition
-        case .needsInput, .finished: Theme.attention
-        }
-    }
 }
 
 // MARK: - The rail's header
 
-// The app's own row: home, the one number worth carrying at the very top, and the phone
-// badge. The running count is the reason to look at the rail at all, so it sits here
-// rather than being found by opening the project it belongs to.
+// The app's own row: home and the few numbers worth carrying at the very top. The running
+// count is the reason to look at the rail at all, so it sits here rather than being found
+// by opening the project it belongs to. Phone sharing reads as a second status line in the
+// same box; stopping a share belongs to the pairing dialog, not to the rail.
 struct SidebarBrandBar: View {
     let runningCount: Int
     let isHome: Bool
     let selectHome: () -> Void
-    let noticeMenu: () -> [MenuEntry]
 
+    @Environment(\.textScale) private var textScale
+    @Environment(MobileAccessController.self) private var mobileAccess
     @State private var hovering = false
 
+    private var phone: SidebarPhoneStatus? { SidebarPhoneStatus(mobileAccess.share) }
+
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: selectHome) {
-                HStack(spacing: 9) {
-                    AppMark()
-                        .frame(width: 26, height: 26)
-                    Text("Teya Code Station")
-                        .font(.logo(18))
-                        .kerning(-0.2)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
+        Button(action: selectHome) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    brand
+                    Spacer(minLength: 0)
+                    statusLines
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(isHome || hovering ? Theme.card : Color.clear))
-                .overlay(RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHome ? Theme.border : Color.clear, lineWidth: 1.3))
-                .contentShape(RoundedRectangle(cornerRadius: 8))
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, -6)
-            .onHover { hovering = $0 }
-            .appTooltip("Home")
-
-            Spacer(minLength: 4)
-
-            if runningCount > 0 {
-                HStack(spacing: 5) {
-                    RunningDot()
-                    Text("\(runningCount)")
-                        .font(.mono(9.5, .semibold))
-                        .kerning(0.7)
-                        .foregroundStyle(Theme.accent)
+                VStack(alignment: .leading, spacing: 8) {
+                    brand
+                    HStack {
+                        Spacer(minLength: 0)
+                        statusLines
+                    }
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 4)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.accent.opacity(0.1)))
-                .appMenu(noticeMenu)
-                .appTooltip("Show active and unread sessions")
             }
-
-            MobileAccessBadge()
+            .padding(.horizontal, 14)
+            .padding(.vertical, 17)
+            .frame(maxWidth: .infinity, minHeight: 68)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(isHome || hovering ? Theme.field : .clear))
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 14)
-        .headerBand(Theme.sidebar)
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .sidebarFocusRing()
+        .accessibilityLabel("Teya Code Station home")
+        .accessibilityValue(Self.accessibilityValue(runningCount: runningCount, phone: phone))
+        .accessibilityAddTraits(isHome ? .isSelected : [])
+        .appTooltip("Home")
     }
+
+    static func accessibilityValue(runningCount: Int, phone: SidebarPhoneStatus?) -> String {
+        [runningCount > 0 ? "\(runningCount) running sessions" : nil, phone?.spoken]
+            .compactMap { $0 }
+            .joined(separator: ", ")
+    }
+
+    private var brand: some View {
+        HStack(spacing: 9) {
+            AppMark()
+                .frame(width: 41, height: 41)
+                .frame(width: 33, height: 33)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Teya")
+                    .font(.logo(9 * max(1, textScale), weight: 500))
+                    .foregroundStyle(.secondary)
+                Text("Code Station")
+                    .font(.logo(15 * max(1, textScale)))
+                    .kerning(-0.55)
+            }
+        }
+        .fixedSize()
+    }
+
+    @ViewBuilder private var statusLines: some View {
+        if runningCount > 0 || phone != nil {
+            VStack(alignment: .trailing, spacing: 4) {
+                if runningCount > 0 {
+                    HStack(spacing: 5) {
+                        RunningDot(size: 5)
+                        Text("\(runningCount) running")
+                    }
+                    .foregroundStyle(Theme.accent)
+                }
+                if let phone {
+                    HStack(spacing: 5) {
+                        Image(systemName: phone.isConnected
+                                ? "iphone.radiowaves.left.and.right" : "iphone")
+                        Text(phone.text)
+                    }
+                    .foregroundStyle(phone.isConnected ? Theme.addition : Theme.accent)
+                }
+            }
+            .font(.system(size: 9.5, weight: .semibold))
+            .fixedSize()
+        }
+    }
+}
+
+// What the brand bar says about the code that is out. It counts as on the phone once a
+// phone has joined it; until then it is only shared.
+struct SidebarPhoneStatus: Equatable {
+    let isConnected: Bool
+
+    init?(_ share: MobileShare?) {
+        guard let share else { return nil }
+        isConnected = share.isConnected
+    }
+
+    init(isConnected: Bool) {
+        self.isConnected = isConnected
+    }
+
+    var text: String { isConnected ? "On phone" : "Shared" }
+
+    var spoken: String { isConnected ? "shared with a connected phone" : "shared with a phone, none connected" }
 }
 
 // Permission prompts and turns that ended while the user was away are the only things in

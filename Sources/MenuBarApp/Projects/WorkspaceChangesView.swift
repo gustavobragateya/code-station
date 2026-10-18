@@ -5,20 +5,25 @@ struct WorkspaceChangesView: View {
     let initialRoot: String
     let initialPath: String?
     @Environment(ProjectStore.self) private var store
+    @Environment(SessionRunner.self) private var runner
     @Binding var selectedRoot: String
     let navigation: ChangesNavigationMemory
+    // Goes back to the conversation, where a sent review is taken up.
+    let reviewSent: () -> Void
     // The file someone asked to open, from outside or from another project's row. Once
     // they move to another project it is served, so coming back opens on whatever was
     // last picked there instead of on this file again.
     @State private var request: ChangesNavigatorItem?
 
     init(session: ChatSession, initialRoot: String, initialPath: String?,
-         selectedRoot: Binding<String>, navigation: ChangesNavigationMemory) {
+         selectedRoot: Binding<String>, navigation: ChangesNavigationMemory,
+         reviewSent: @escaping () -> Void = {}) {
         self.session = session
         self.initialRoot = initialRoot
         self.initialPath = initialPath
         _selectedRoot = selectedRoot
         self.navigation = navigation
+        self.reviewSent = reviewSent
         _request = State(initialValue: ChangesNavigatorItem(root: initialRoot, path: initialPath))
     }
 
@@ -34,7 +39,8 @@ struct WorkspaceChangesView: View {
         ChangesView(root: selectedRoot,
                     repositories: roots.map { ChangesRepository(root: $0, name: name($0)) },
                     requestedPath: request?.root == selectedRoot ? request?.path : nil,
-                    navigation: navigation) { root, path in
+                    navigation: navigation,
+                    review: review) { root, path in
             request = ChangesNavigatorItem(root: root, path: path)
             selectedRoot = root
         }
@@ -42,6 +48,24 @@ struct WorkspaceChangesView: View {
         .onChange(of: ChangesNavigatorItem(root: initialRoot, path: initialPath)) { _, item in
             if item.path != nil { request = item }
         }
+    }
+
+    private var review: ReviewTarget {
+        let sessionID = session.id
+        let author = runner.author(of: session)
+        return ReviewTarget(sessionID: sessionID, agent: session.agent, reviews: runner.reviews,
+                            authorModel: author.model, authorEffort: author.effort,
+                            executable: { [runner] in runner.executable(for: $0) },
+                            isBusy: { [runner] in runner.state(sessionID).isBusy },
+                            send: { [runner, store] in runner.send($0, sessionID: sessionID, store: store) },
+                            openChat: reviewSent,
+                            conversation: { [store, session, initialRoot] in
+                                let current = store.session(sessionID) ?? session
+                                return ReviewConversation(
+                                    directory: store.workingDirectories(for: current).first ?? initialRoot,
+                                    claudeSessionID: current.agentSessionID(for: .claudeCode),
+                                    recentChat: SideQuestion.recentChat(current.messages))
+                            })
     }
 
     private func name(_ root: String) -> String {

@@ -1,9 +1,44 @@
-import Foundation
+import AppKit
+import SwiftUI
 import Testing
 @testable import MenuBarApp
 
 @Suite("Global command search")
 struct GlobalCommandPaletteTests {
+    @MainActor
+    @Test func escapeClearsTheSearchBeforeReturningToTheSidebar() async throws {
+        let (store, _) = TestStore.make()
+        let controller = GlobalCommandPaletteController()
+        controller.open()
+        let host = NSHostingController(rootView: GlobalCommandPalette(openSettings: {})
+            .environment(store)
+            .environment(SessionRunner(paths: [:]))
+            .environment(controller)
+            .appOverlays())
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 420),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentViewController = host
+        defer { window.contentViewController = nil }
+        window.layoutIfNeeded()
+        #expect(await waitUntil { window.firstResponder is NSTextView })
+        let editor = try #require(window.firstResponder as? NSTextView)
+        editor.insertText("no-such-destination", replacementRange: NSRange(location: NSNotFound, length: 0))
+        await Task.yield()
+
+        let escape = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "\u{1b}",
+            charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53))
+        window.sendEvent(escape)
+        #expect(await waitUntil { editor.string.isEmpty })
+        #expect(controller.isPresented)
+        #expect(controller.sidebarFocusRequest == 0)
+
+        #expect(window.performKeyEquivalent(with: escape))
+        #expect(await waitUntil { !controller.isPresented })
+        #expect(controller.sidebarFocusRequest == 1)
+    }
+
     @Test func ranksAttentionBeforeRecentWorkAndNavigation() {
         let recent = item(.session(UUID()), category: .sessions, group: .recent,
                           title: "Recent session", priority: 2)

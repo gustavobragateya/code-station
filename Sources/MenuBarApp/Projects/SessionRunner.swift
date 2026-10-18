@@ -107,6 +107,12 @@ final class SessionRunner {
     }
 
     let composer = SessionComposerStore()
+    // Comments left on each session's changes, waiting to be sent back to its agent.
+    let reviews: ReviewCommentStore
+    // Second opinions on plans and answers in Chat, waiting for the person to send them.
+    let opinions = ChatOpinionStore()
+    // Second opinions on each Design session's screens, with the notes they pinned.
+    let designOpinions = DesignOpinionStore()
 
     // How wide the canvas is showing the design, in CSS pixels. The agent writes HTML it
     // never sees rendered, so without this it designs for a window it imagined and the
@@ -198,6 +204,9 @@ final class SessionRunner {
          }) {
         self.configs = configs
         self.persistentAgentSessions = persistentAgentSessions
+        // A runner that keeps nothing between launches, as tests make, keeps no review either.
+        reviews = ReviewCommentStore(url: persistentAgentSessions
+            ? AppPaths.supportFile("review-comments.json") : nil)
         self.discoveredModels = discoveredModels
         self.stalledAfter = stalledAfter
         self.stallCheckInterval = stallCheckInterval
@@ -279,6 +288,17 @@ final class SessionRunner {
                 discoveredModels[agent] = models
             }
         }
+    }
+
+    // The seat a session's own agent works in, which a second opinion's independence is
+    // measured against. Read the way a launch reads it, falling back to the model the
+    // agent last reported running on.
+    func author(of session: ChatSession) -> SecondOpinion.Reviewer {
+        let model = validModel(session.settings?.model, for: session.agent)
+            ?? session.usage?.model(for: session.agent)
+        let effort = validEffort(session.settings?.effort ?? defaults(for: session.agent).effort,
+                                 for: session.agent, model: model)
+        return SecondOpinion.Reviewer(agent: session.agent, model: model, effort: effort)
     }
 
     func modelOptions(for agent: AgentKind) -> [ModelChoice.Option] {
@@ -440,7 +460,7 @@ final class SessionRunner {
         // and in the session's settings, which every later turn is started from.
         var settingsAfterPlan: SessionSettings?
         var leavingPlanFor: PermissionMode?
-        if request.toolName == "ExitPlanMode", answer != .deny,
+        if request.toolName == "ExitPlanMode", answer.allows,
            let session = store.session(sessionID) {
             var settings = session.settings ?? SessionSettings()
             if settings.permissionMode == PermissionMode.plan.rawValue {
@@ -473,6 +493,12 @@ final class SessionRunner {
         if case .answers(let given) = answer, !given.isEmpty,
            let carriesOn = store.recordAnswer(PermissionRequest.transcript(of: given),
                                               in: sessionID, continuing: turn.messageID) {
+            turn.messageID = carriesOn
+        }
+        // What a plan was sent back with travels as the refusal's reason, which the
+        // conversation would otherwise never show.
+        if case .revise(let feedback) = answer,
+           let carriesOn = store.recordAnswer(feedback, in: sessionID, continuing: turn.messageID) {
             turn.messageID = carriesOn
         }
     }
@@ -1149,6 +1175,10 @@ final class SessionRunner {
     // interrupting for. It is the same point at which the meter turns red.
     static let nearlyFullContext = 0.85
 
+    // Where an agent's CLI was found, for the runs that ask one something outside any
+    // session, such as a second opinion on a review. Nil when it is not installed.
+    func executable(for agent: AgentKind) -> String? { paths[agent] }
+
     func isNudgeDismissed(_ sessionID: UUID) -> Bool {
         records[sessionID]?.nudgeDismissed ?? false
     }
@@ -1406,6 +1436,9 @@ final class SessionRunner {
         codexContextRefreshes.removeValue(forKey: sessionID)?.task.cancel()
         records[sessionID] = nil
         composer.remove(sessionID)
+        reviews.remove(sessionID)
+        opinions.remove(sessionID)
+        designOpinions.dismiss(sessionID)
         canvasWidths[sessionID] = nil
     }
 
@@ -1503,6 +1536,14 @@ final class SessionRunner {
         if let git = GitInspector.tool() {
             TreeSnapshots.shared.baseline(at: workingDirectory, using: git)
         }
+        // Read before the agent starts, which is long before it could make a commit.
+        let startHeads = Task {
+            var heads: [String: String] = [:]
+            for directory in workingDirectories {
+                heads[directory] = await GitInspector.head(at: directory)
+            }
+            return heads
+        }
 
         // Summaries belong to the session title or recap card, so their replies stay
         // private to the turn.
@@ -1549,6 +1590,10 @@ final class SessionRunner {
 
         turn.isFirstTurn = isFirstTurn
         recordAddingIfMissing(sessionID).turn = turn
+        Task { [weak turn] in
+            let heads = await startHeads.value
+            turn?.startHeads = heads
+        }
         if let presetSessionID = plan.presetSessionID {
             turn.agentSessionID = presetSessionID
             store.setAgentSessionID(presetSessionID, agent: agent, for: sessionID)
@@ -2649,6 +2694,13 @@ final class SessionRunner {
         records[sessionID]?.startedGroups = carried
         cleanUp(turn)
         restorePreviousConversation(turn, status: status, sessionID: sessionID, store: store)
+        // A review sent to the session is judged against the files as this turn left them,
+        // and what the agent wrote is split into answers to its comments.
+        if turn.summary == nil {
+            let prompt = turn.prompt
+            let reply = ReviewAnswers.reply(to: prompt, in: store.session(sessionID)?.messages ?? [])
+            Task { await reviews.turnEnded(sessionID, prompt: prompt, reply: reply) }
+        }
 
         // Even a recap must stay stopped after exceeding the limit. Starting queued
         // work or a fallback summary here can immediately repeat the memory spike.
@@ -2705,7 +2757,7 @@ final class SessionRunner {
             let unseen: Bool
             records[sessionID]?.lastEnding = TurnEnding(
                 started: turn.startedAt, ended: Date(),
-                outcome: turn.stopFailure == nil ? .stopped : .failed)
+                outcome: turn.stopFailure == nil ? .stopped : .failed, startHeads: turn.startHeads)
             if let failure = turn.stopFailure {
                 setState(.failed(failure), for: sessionID)
                 unseen = store.noteTurnEnded(for: sessionID)
@@ -2727,7 +2779,7 @@ final class SessionRunner {
         guard turn.failure != nil || status != 0 || missingCompletion else {
             SessionLog.note("turn finished", session: sessionID)
             records[sessionID]?.lastEnding = TurnEnding(started: turn.startedAt, ended: Date(),
-                                                        outcome: .finished)
+                                                        outcome: .finished, startHeads: turn.startHeads)
             setState(.idle, for: sessionID)
             let titleQueued = queueAutomaticTitle(after: turn, sessionID: sessionID,
                                                   store: store)
@@ -2795,7 +2847,7 @@ final class SessionRunner {
             records[sessionID]?.continuable = .failedTurn
         }
         records[sessionID]?.lastEnding = TurnEnding(started: turn.startedAt, ended: Date(),
-                                                    outcome: .failed)
+                                                    outcome: .failed, startHeads: turn.startHeads)
         setState(.failed(message), for: sessionID)
         store.release(sessionID, for: .running)
         resumeDesignWorkflowQueues(after: sessionID, store: store)
@@ -2980,6 +3032,7 @@ final class SessionRunner {
         // Fixed at the moment the turn began, which is what the status strip counts from
         // while it runs. `lastActivity` cannot answer that: it moves all turn.
         let startedAt = Date()
+        var startHeads: [String: String] = [:]
 
         // One line down the pipe the CLI is reading. False when it could not be sent: the
         // process is gone, or its end of the pipe is shut.

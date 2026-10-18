@@ -58,7 +58,7 @@ final class WindowKeyMonitor {
 
     // Which of a sheet and the window it hangs off counts as key is not worth relying on,
     // so the chain is followed to whichever sheet ended up on top.
-    private static var frontmostWindow: NSWindow? {
+    static var frontmostWindow: NSWindow? {
         var window = NSApp.keyWindow
         while let sheet = window?.attachedSheet { window = sheet }
         return window
@@ -76,6 +76,61 @@ struct WindowAnchor: NSViewRepresentable {
     }
 
     func updateNSView(_ view: NSView, context: Context) { monitor.anchor = view }
+
+    private final class AnchorView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+// Hears every key press in its window and lets a view decide which are its own, for a
+// screen whose keys are single letters that only mean something while nothing is being
+// typed. A press while a text field or a shell has the keyboard is always left alone.
+@MainActor
+final class WindowKeyHandler {
+    weak var anchor: NSView?
+
+    private var token: Any?
+    private var handle: ((NSEvent) -> Bool)?
+
+    func start(_ handle: @escaping (NSEvent) -> Bool) {
+        self.handle = handle
+        guard token == nil else { return }
+        token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            nonisolated(unsafe) let event = event
+            return MainActor.assumeIsolated { self.take(event) } ? nil : event
+        }
+    }
+
+    func stop() {
+        if let token { NSEvent.removeMonitor(token) }
+        token = nil
+        handle = nil
+    }
+
+    private func take(_ event: NSEvent) -> Bool {
+        guard let handle, let window = anchor?.window,
+              WindowKeyMonitor.routes(to: window, frontmost: WindowKeyMonitor.frontmostWindow),
+              event.window === window,
+              !Self.isTyping(window.firstResponder) else { return false }
+        return handle(event)
+    }
+
+    static func isTyping(_ responder: NSResponder?) -> Bool {
+        if let text = responder as? NSTextView { return text.isEditable }
+        return responder is NSTextField
+    }
+}
+
+struct WindowKeyAnchor: NSViewRepresentable {
+    let handler: WindowKeyHandler
+
+    func makeNSView(context: Context) -> NSView {
+        let view = AnchorView()
+        handler.anchor = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) { handler.anchor = view }
 
     private final class AnchorView: NSView {
         override func hitTest(_ point: NSPoint) -> NSView? { nil }

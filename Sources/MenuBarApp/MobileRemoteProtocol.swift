@@ -32,14 +32,11 @@ struct RemoteCommand: Decodable, Equatable {
     var worktree: Bool?
 }
 
-// The list a browsing code opens on. It is compared with the last one sent before it goes
-// out, so a phone sitting on the list costs nothing until something in it moves.
+// The list a phone opens on. It is compared with the last one sent before it goes out, so
+// a phone sitting on the list costs nothing until something in it moves.
 struct RemoteDirectory: Encodable, Equatable {
     let type = "directory"
     let version = 1
-    let title: String
-    let scope: String
-    let canCreate: Bool
     let projects: [RemoteProject]
 }
 
@@ -91,11 +88,7 @@ struct RemoteSnapshot: Encodable {
     let type = "snapshot"
     let version = 1
     let sessionID: String
-    // Whether there is a list to go back to, which is what puts the back arrow on the
-    // header of a session opened from a project or from the whole app.
-    let canBrowse: Bool
     var conversation: RemoteCommand.Conversation = .main
-    var scope: String = "This session only"
     let header: RemoteHeader
     let messages: [RemoteMessage]
     let queued: [RemoteQueuedPrompt]

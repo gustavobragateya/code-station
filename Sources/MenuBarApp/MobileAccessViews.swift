@@ -1,46 +1,23 @@
 import SwiftUI
 
-// The desktop side of mobile access: the button that hands out a code, the badge that
-// says how many are out, and the sheet that shows one.
+// The desktop side of mobile access: the button that hands out the code and the dialog
+// that shows it.
 
-// The dialog behind the QR button, kept apart from it so a header that folds its actions
-// into a menu opens the same thing without drawing the button.
+// The dialog behind the Home phone pill, kept apart from it so the pills on the Home map
+// open the same thing.
 @MainActor
 enum MobilePairing {
-    static func open(scope: MobileScope, dialogs: DialogPresenter, store: ProjectStore) {
+    static func open(dialogs: DialogPresenter) {
         dialogs.show(Dialog(
-            title: title(scope, store: store),
+            title: "Open Code Station on your phone",
             message: """
-            \(reach(scope, store: store))
+            A phone on the same trusted Wi-Fi can read any session in any project, start new ones anywhere, send prompts, stop turns and answer requests.
 
             No phone can connect until you start sharing below. Sharing continues after this dialog closes. Reopen it to cancel or stop sharing.
             """,
-            content: AnyView(MobilePairingView(scope: scope)),
+            content: AnyView(MobilePairingView()),
             actions: [.init(label: "Done", kind: .primary)],
             width: 390))
-    }
-
-    static var menuLabel: String { "Pair phone - QR code" }
-
-    private static func title(_ scope: MobileScope, store: ProjectStore) -> String {
-        switch scope {
-        case .session: "Open this session on your phone"
-        case .project(let id): "Open \(store.project(id)?.name ?? "this project") on your phone"
-        case .everything: "Open Code Station on your phone"
-        }
-    }
-
-    // What the code lets the phone do, said plainly, because it is the whole difference
-    // between the three codes.
-    private static func reach(_ scope: MobileScope, store: ProjectStore) -> String {
-        switch scope {
-        case .session:
-            "A phone on the same trusted Wi-Fi can read this one session, send prompts, stop turns and answer requests. It can reach nothing else."
-        case .project(let id):
-            "A phone on the same trusted Wi-Fi can read any session in \(store.project(id)?.name ?? "this project"), start new ones there, send prompts, stop turns and answer requests."
-        case .everything:
-            "A phone on the same trusted Wi-Fi can read any session in any project, start new ones anywhere, send prompts, stop turns and answer requests."
-        }
     }
 }
 
@@ -56,7 +33,7 @@ enum PhoneLink: Equatable {
         return shared ? .waiting : .none
     }
 
-    // The words the rail shows. The pairing does not say what the phone is called, so it
+    // The words the pill shows. The pairing does not say what the phone is called, so it
     // is named as a phone.
     var word: String? {
         switch self {
@@ -83,167 +60,155 @@ enum PhoneLink: Equatable {
     }
 }
 
-// The QR button as a header wears it. The same control sits on a session, on a project and
-// on Home; what changes is how far the code it makes can reach.
+// The phone pill on the Home header, the one place a code is handed out. The code reaches
+// the whole app, so a phone is either in on everything or on nothing.
 struct MobileAccessButton: View {
-    let scope: MobileScope
-    // Smaller where it shares a line with the session's own facts rather than sitting in
-    // a header of its own.
-    var side: CGFloat = 30
-    // On the session header the button becomes a capsule that names the link once there
-    // is one, since it is the only thing on the rail that speaks for something outside
-    // the app.
-    var onRail = false
-    var showsWord = true
-
     @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(DialogPresenter.self) private var dialogs
-    @Environment(ProjectStore.self) private var store
 
     var body: some View {
-        let share = mobileAccess.share(for: scope)
-        let connected = mobileAccess.isLive(scope)
-        let label = tooltip(shared: share != nil, connected: connected)
-        return Group {
-            if onRail {
-                PhoneCapsule(link: .of(shared: share != nil, connected: connected),
-                             showsWord: showsWord,
-                             label: label,
-                             action: open)
-            } else {
-                let tint = if connected {
-                    Theme.addition
-                } else if share != nil {
-                    Theme.accent
-                } else {
-                    Color.secondary
-                }
-                GlyphButton(icon: "qrcode", side: side, tint: tint, action: open)
-                    .appTooltip(label)
-                    .accessibilityLabel(label)
-            }
+        let shared = mobileAccess.share != nil
+        let connected = mobileAccess.share?.isConnected == true
+        PhonePill(link: .of(shared: shared, connected: connected),
+                  label: tooltip(shared: shared, connected: connected)) {
+            MobilePairing.open(dialogs: dialogs)
         }
     }
 
     private func tooltip(shared: Bool, connected: Bool) -> String {
         if connected { return "Phone connected" }
         if shared { return "Shared with a phone" }
-        return switch scope {
-        case .session: "Open this session on a phone"
-        case .project: "Open this project on a phone"
-        case .everything: "Open Code Station on a phone"
-        }
-    }
-
-    private func open() {
-        MobilePairing.open(scope: scope, dialogs: dialogs, store: store)
+        return "Open Code Station on a phone"
     }
 }
 
-// The phone button on the session rail. With nothing shared it is a bare QR glyph; once a
-// code is out it fills amber and says it is waiting, and once a phone joins it turns green
-// with a slow ring around its light.
-private struct PhoneCapsule: View {
+// A bordered pill that says "Open on phone" while nothing is shared, and lets a peek card
+// explain what that means. Once a code is out it fills amber and says it is waiting, and
+// once a phone joins it turns green with a slow ring around its light.
+private struct PhonePill: View {
     let link: PhoneLink
-    let showsWord: Bool
     let label: String
     let action: () -> Void
 
     @State private var hovering = false
+    @State private var anchor = FrameAnchor()
+    @FocusState private var focused: Bool
+
+    static let offer = "Open on phone"
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                switch link {
-                case .none:
-                    Image(systemName: "qrcode")
-                        .font(.system(size: 13, weight: .semibold))
-                case .waiting:
-                    Circle()
-                        .fill(Theme.attention)
-                        .frame(width: 6, height: 6)
-                case .connected:
-                    PulsingDot(colour: Theme.addition, size: 6)
-                }
-                if showsWord, let word = link.word {
-                    Text(word)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(1)
-                        .fixedSize()
-                        .transition(.opacity)
+        let offering = link == .none
+        return Button(action: action) {
+            HStack(spacing: 8) {
+                lead
+                Text(link.word ?? Self.offer)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .foregroundStyle(offering ? Theme.accent : link.tint)
+            .padding(.leading, offering ? 11 : 12)
+            .padding(.trailing, 14)
+            .frame(height: 32)
+            .background(Capsule().fill(link.fill ?? Theme.card))
+            .overlay {
+                if offering {
+                    Capsule().stroke(lit ? Theme.accent.opacity(0.4) : Theme.settingsBorder)
                 }
             }
-            .foregroundStyle(link == .none && hovering ? Color.primary : link.tint)
-            .padding(.horizontal, link == .none ? 8 : 10)
-            .frame(minWidth: 30, minHeight: 30)
-            .background(Capsule().fill(link.fill ?? (hovering ? Theme.field : Color.clear)))
+            .shadow(color: Theme.accent.opacity(offering && lit ? 0.1 : 0), radius: 5, y: 3)
             .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressablePill())
+        .focused($focused)
         .onHover { hovering = $0 }
-        .motion(Motion.hover, value: hovering)
+        .motion(Motion.hover, value: lit)
         .motion(HeaderMotion.slide, value: link)
-        .appTooltip(delay: .zero) {
-            Tooltip(title: label,
-                    subtitle: link == .none
-                        ? "Scan a code to follow this session"
-                        : "Show the code or stop sharing")
+        .appTooltip(delay: .zero, isFocused: focused && offering) {
+            if offering {
+                Tooltip(title: "", hanging: Tooltip.Hanging(
+                    width: PhonePeek.width,
+                    edges: peekEdges,
+                    content: AnyView(PhonePeek())))
+            } else {
+                Tooltip(title: label, subtitle: "Show the code or stop sharing")
+            }
         }
-        .accessibilityLabel("Phone")
+        .background(FrameAnchorView(anchor: anchor))
+        .accessibilityLabel(label)
         .accessibilityValue(link.word ?? "Not shared")
+    }
+
+    private var lit: Bool { hovering || focused }
+
+    @ViewBuilder
+    private var lead: some View {
+        switch link {
+        case .none:
+            Image(systemName: "qrcode")
+                .font(.system(size: 12.5, weight: .semibold))
+        case .waiting:
+            Circle()
+                .fill(Theme.attention)
+                .frame(width: 6, height: 6)
+        case .connected:
+            PulsingDot(colour: Theme.addition, size: 6)
+        }
+    }
+
+    // The pill sits at the right edge of the header, so its card lines up with the pill's
+    // right side rather than hanging past the window.
+    private var peekEdges: ClosedRange<CGFloat> {
+        guard let frame = anchor.frame() else { return 0...PhonePeek.width }
+        return (frame.maxX - PhonePeek.width)...frame.maxX
     }
 }
 
-// Every code that is out, wherever it was made. The three buttons that hand out access sit
-// on the session, the project and Home, so without this there is no one place that says
-// what a phone can reach or takes it back.
-struct MobileAccessBadge: View {
-    @Environment(MobileAccessController.self) private var mobileAccess
+// Pressing the pill gives a little under the pointer. The scale is on the label, never on
+// the button, since the button carries AppKit-backed hover and tooltip views.
+private struct PressablePill: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .motion(Motion.hover, value: configuration.isPressed)
+    }
+}
+
+// What the Home phone pill offers, shown before anything is shared. The code is only a
+// picture of one, blurred, since no code exists until sharing starts.
+private struct PhonePeek: View {
+    static let width: CGFloat = 280
+    static let title = "Take Code Station with you"
+    static let message = "Scan a code to watch your sessions and answer them from your phone. Works on the same Wi-Fi."
 
     var body: some View {
-        let shares = mobileAccess.activeShares
-        if !shares.isEmpty {
-            let connected = shares.count(where: \.isConnected)
-            let tint = connected > 0 ? Theme.addition : Theme.accent
-            HStack(spacing: 5) {
-                Image(systemName: connected > 0
-                        ? "iphone.radiowaves.left.and.right" : "iphone")
-                    .font(.system(size: 10, weight: .semibold))
-                Text("\(shares.count)")
-                    .font(.mono(9.5, .semibold))
-                    .kerning(0.7)
+        HStack(spacing: 14) {
+            Group {
+                if let url = URL(string: "https://code-station.invalid/m"),
+                   let image = MobilePairingQRCode.image(for: url) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .blur(radius: 2.5)
+                        .opacity(0.55)
+                }
             }
-            .foregroundStyle(tint)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(0.1)))
-            .appMenu { menu(shares) }
-            .appTooltip(connected > 0
-                        ? "\(connected) of \(shares.count) shared with a connected phone"
-                        : "Shared with a phone")
-            .accessibilityLabel("Mobile access")
+            .frame(width: 60, height: 60)
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.white))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(Self.title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(Self.message)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-    }
-
-    private func menu(_ shares: [MobileShareSummary]) -> [MenuEntry] {
-        var entries: [MenuEntry] = shares.map { share in
-            .item(share.name,
-                  icon: share.isConnected
-                      ? "iphone.radiowaves.left.and.right" : "iphone",
-                  subtitle: "\(share.state) · \(share.reach)",
-                  detail: "Revoke",
-                  detailColour: Theme.deletion,
-                  detailAction: {
-                      mobileAccess.revoke(share.scope)
-                  })
-        }
-        if shares.count > 1 {
-            entries.append(.separator)
-            entries.append(.item("Revoke all", kind: .destructive, icon: "xmark.circle") {
-                mobileAccess.stop()
-            })
-        }
-        return entries
+        .padding(14)
     }
 }
 
@@ -255,7 +220,6 @@ struct MobilePairingView: View {
     }
 
     @Environment(MobileAccessController.self) private var mobileAccess
-    let scope: MobileScope
 
     @State private var starting = false
     @State private var confirming = false
@@ -263,7 +227,7 @@ struct MobilePairingView: View {
 
     var body: some View {
         Group {
-            if let share = mobileAccess.share(for: scope) {
+            if let share = mobileAccess.share {
                 VStack(spacing: 14) {
                     if let image = MobilePairingQRCode.image(for: share.url) {
                         Image(nsImage: image)
@@ -276,10 +240,9 @@ struct MobilePairingView: View {
 
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(mobileAccess.isLive(scope) ? Theme.addition : Color.secondary)
+                            .fill(share.isConnected ? Theme.addition : Color.secondary)
                             .frame(width: 7, height: 7)
-                        Text(mobileAccess.isLive(scope)
-                             ? "Phone connected" : "Waiting for the phone")
+                        Text(share.isConnected ? "Phone connected" : "Waiting for the phone")
                             .font(.system(size: 12, weight: .semibold))
                     }
 
@@ -292,7 +255,7 @@ struct MobilePairingView: View {
 
                     ActionButton(title: share.isConnected ? "Stop sharing" : "Cancel sharing",
                                  tone: .danger, height: 38, size: 13, fills: true) {
-                        mobileAccess.revoke(scope)
+                        mobileAccess.revoke()
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -341,8 +304,8 @@ struct MobilePairingView: View {
         .padding(.top, 12)
     }
 
-    // A code that can browse hands over more than the screen the button was pressed on, so
-    // that reach is spelled out once more and has to be agreed to before the code exists.
+    // The code hands over every project, so that reach is spelled out once more and has to
+    // be agreed to before the code exists.
     private var confirmation: some View {
         VStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle")
@@ -354,7 +317,7 @@ struct MobilePairingView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(warning)
+                Text("Whoever scans it can browse every project, read any session and start new ones anywhere, all running on this Mac. Only scan it on a phone you trust.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -373,29 +336,16 @@ struct MobilePairingView: View {
         .padding(.top, 12)
     }
 
-    private var warning: String {
-        switch scope {
-        case .project:
-            "Whoever scans it can browse every session in this project, read what they say and start new ones that run on this Mac. Only scan it on a phone you trust."
-        default:
-            "Whoever scans it can browse every project, read any session and start new ones anywhere, all running on this Mac. Only scan it on a phone you trust."
-        }
-    }
-
     private var contentState: ContentState {
-        if mobileAccess.share(for: scope) != nil { return .sharing }
+        if mobileAccess.share != nil { return .sharing }
         if confirming { return .confirming }
         return .idle(hasFailure: failure != nil)
     }
 
     private func startSharing() {
         guard !starting else { return }
-        guard !scope.canBrowse else {
-            failure = nil
-            confirming = true
-            return
-        }
-        begin()
+        failure = nil
+        confirming = true
     }
 
     private func begin() {
@@ -406,7 +356,7 @@ struct MobilePairingView: View {
         Task { @MainActor in
             defer { starting = false }
             do {
-                _ = try await mobileAccess.startSharing(scope)
+                _ = try await mobileAccess.startSharing()
             } catch let error as LANServerFailure {
                 failure = error.message
             } catch {

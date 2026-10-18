@@ -64,7 +64,7 @@ struct HomeView: View {
             Spacer(minLength: 12)
 
             if appSettings.mobileAccessEnabled {
-                MobileAccessButton(scope: .everything)
+                MobileAccessButton()
             }
         }
         .padding(.horizontal, 24)

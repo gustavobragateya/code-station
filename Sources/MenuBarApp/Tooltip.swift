@@ -167,8 +167,9 @@ extension View {
     // The hint is built when it is about to be shown, so it can read state that has
     // moved on since the view was laid out.
     func appTooltip(delay: Duration = TooltipPresenter.hoverDelay,
+                    isFocused: Bool = false,
                     _ tooltip: @escaping () -> Tooltip) -> some View {
-        modifier(AppTooltip(delay: delay, tooltip: tooltip))
+        modifier(AppTooltip(delay: delay, isFocused: isFocused, tooltip: tooltip))
     }
 
     // The one-line form, for a control whose icon does not say what it does.

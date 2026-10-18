@@ -156,6 +156,52 @@ struct HomeWorkMapTests {
         expectNoOverlaps(layout)
     }
 
+    @Test func phoneBandPushesTheWholeMapDownWithoutReshapingIt() {
+        let map = HomeWorkMap(sessions: day([2, 1, 3]))
+        let plain = OrbitLayout(map: map, width: 1100)
+        let banded = OrbitLayout(map: map, width: 1100, phoneBand: OrbitLayout.phoneBand)
+        #expect(banded.size.height == plain.size.height + OrbitLayout.phoneBand)
+        #expect(banded.hub.y == plain.hub.y + OrbitLayout.phoneBand)
+        #expect(banded.pills.map(\.frame.minY) == plain.pills.map { $0.frame.minY + OrbitLayout.phoneBand })
+        // The line from a pill at the top of the band has room to fall before it meets the ring.
+        #expect(banded.ringTop.y - OrbitPhoneBeacon.height > 30)
+        expectNoOverlaps(banded)
+    }
+
+    @Test func phonePillSaysWhetherAPhoneJoinedAndWhereItIs() {
+        let waiting = OrbitPhoneLink(connected: false, openSession: nil, openTitle: nil)
+        #expect(waiting.state == "Waiting for phone")
+        #expect(waiting.reachText == "Code is out for every project")
+
+        let connected = OrbitPhoneLink(connected: true, openSession: nil, openTitle: nil)
+        #expect(connected.state == "Phone connected")
+        #expect(connected.reachText == "Can reach every project")
+
+        let reading = OrbitPhoneLink(connected: true, openSession: UUID(), openTitle: "Fix the share sheet")
+        #expect(reading.reachText == "Open on Fix the share sheet")
+        #expect(reading.accessibilityLabel
+                == "Phone connected. Open on Fix the share sheet. Show the code or stop sharing.")
+
+        // A session the code still remembers from a phone that dropped is not where a phone is now.
+        let dropped = OrbitPhoneLink(connected: false, openSession: UUID(), openTitle: "Fix the share sheet")
+        #expect(dropped.openSession == nil)
+        #expect(dropped.reachText == "Code is out for every project")
+    }
+
+    @Test func aConnectedPhoneLightsThePathToTheSessionItHasOpen() {
+        let other = live()
+        let map = HomeWorkMap(sessions: [live(), other])
+
+        let reading = OrbitPhoneLink(connected: true, openSession: other.id, openTitle: "Other")
+        let onSession = OrbitPhoneReach(link: reading, map: map)
+        #expect(onSession.wires == ["hub:\(other.containerID)", "session:\(other.id)"])
+        #expect(onSession.sessions == [other.id])
+
+        let onList = OrbitPhoneLink(connected: true, openSession: nil, openTitle: nil)
+        #expect(OrbitPhoneReach(link: onList, map: map) == OrbitPhoneReach())
+        #expect(OrbitPhoneReach(link: nil, map: map) == OrbitPhoneReach())
+    }
+
     private func tile(_ node: OrbitLayout.Node) -> CGRect {
         // The tile with its halo, and the name under it.
         CGRect(x: node.center.x - 26, y: node.center.y - 26, width: 52, height: 72)
