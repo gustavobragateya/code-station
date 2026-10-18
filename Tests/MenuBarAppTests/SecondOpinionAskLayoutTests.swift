@@ -4,15 +4,15 @@ import Testing
 @testable import MenuBarApp
 
 // The ask dialog sits centred over a tall window, so it is offered far more height than
-// it needs. It must keep to its content rather than stretch the reviewer cards to fill it.
+// it needs. It must keep to its content rather than stretch to fill it.
 @MainActor
 struct SecondOpinionAskLayoutTests {
 
     @Test func theAskDialogKeepsToItsContentInATallWindow() {
         var height: CGFloat = 0
-        let ask = SecondOpinionAskView(
-            sessionAgent: .claudeCode, installed: [.codex, .copilot, .claudeCode], running: [],
-            reviewers: [.codex], focus: [], scope: .all,
+        let ask = ChangesOpinionAsk(
+            author: SecondOpinion.Reviewer(agent: .claudeCode), installed: [.codex, .copilot, .claudeCode],
+            running: [], lineup: [SecondOpinion.Reviewer(agent: .codex)], focus: [], scope: .all,
             fileCount: 19, fileName: "App.swift", canReadSince: false, ask: { _, _, _ in })
         let root = ZStack {
             ask.frame(width: 620)
@@ -20,7 +20,9 @@ struct SecondOpinionAskLayoutTests {
         }
         .frame(width: 1400, height: 1200)
         .environment(DialogPresenter())
+        .environment(SessionRunner(paths: [:]))
         .environment(TooltipPresenter())
+        .environment(MenuPresenter())
 
         let host = NSHostingView(rootView: root)
         host.frame = NSRect(x: 0, y: 0, width: 1400, height: 1200)

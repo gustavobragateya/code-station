@@ -285,13 +285,29 @@ struct ReviewCommentTests {
         #expect(!comment.onFile)
     }
 
+    @Test func twoSeatsOfOneAgentOnDifferentModelsAreTwoVoices() {
+        let store = ReviewCommentStore(url: nil)
+        let session = UUID()
+        var sol = comment(.new, 12, excerpt: "y", body: "Off by one")
+        sol.author = .agent(.codex)
+        sol.reviewerModel = "Sol high"
+        var luna = comment(.new, 12, excerpt: "y", body: "Loop ends early")
+        luna.author = .agent(.codex)
+        luna.reviewerModel = "Luna"
+        store.finishSecondOpinion(session, reviewer: .init(agent: .codex, model: "gpt-5.6-sol"), outcome: .success([sol]))
+        store.finishSecondOpinion(session, reviewer: .init(agent: .codex, model: "gpt-5.6-luna"), outcome: .success([luna]))
+        let merged = store.pending(session)
+        #expect(merged.count == 1)
+        #expect(merged.first?.voices.map(\.name) == ["Codex on Sol high", "Codex on Luna"])
+    }
+
     @Test func aFindingIsNeverSentUntilItIsKept() {
         let store = ReviewCommentStore(url: nil)
         let session = UUID()
         store.add(comment(.new, 11, excerpt: "x", body: "Mine"), to: session)
         var finding = comment(.new, 12, excerpt: "y", body: "Theirs")
         finding.author = .agent(.codex)
-        store.finishSecondOpinion(session, agent: .codex, outcome: .success([finding]))
+        store.finishSecondOpinion(session, reviewer: .init(agent: .codex), outcome: .success([finding]))
         #expect(store.pending(session).map(\.body) == ["Theirs"])
         #expect(store.kept(session).map(\.body) == ["Mine"])
 
@@ -356,18 +372,18 @@ struct ReviewCommentTests {
         let session = UUID()
         var finding = comment(.new, 12, excerpt: "y", body: "From Codex")
         finding.author = .agent(.codex)
-        store.finishSecondOpinion(session, agent: .codex, outcome: .success([finding]))
+        store.finishSecondOpinion(session, reviewer: .init(agent: .codex), outcome: .success([finding]))
 
         let request = SecondOpinionRequest(repositories: [ReviewRepository(root: scratch.path, name: "App")],
                                            executable: "/usr/bin/false")
-        store.startSecondOpinion(session, agent: .copilot, request: request)
-        #expect(store.isReviewing(session, agent: .copilot))
+        store.startSecondOpinion(session, reviewer: .init(agent: .copilot), request: request)
+        #expect(store.isReviewing(session, reviewer: .init(agent: .copilot)))
         #expect(await waitUntil { store.runs(session).first?.state == .failed("There are no changes to review.") })
         #expect(store.pending(session).map(\.body) == ["From Codex"])
 
-        store.retrySecondOpinion(session, agent: .copilot)
+        store.retrySecondOpinion(session, reviewer: .init(agent: .copilot))
         #expect(store.runs(session).first?.isRunning == true)
-        store.stopSecondOpinion(session, agent: .copilot)
+        store.stopSecondOpinion(session, reviewer: .init(agent: .copilot))
         #expect(store.runs(session).isEmpty)
     }
 
@@ -642,6 +658,61 @@ struct SecondOpinionTests {
         let codex = SecondOpinion.arguments(for: .codex, prompt: "p")
         #expect(codex.contains("read-only"))
         #expect(codex.last == "p")
+    }
+
+    @Test func eachSeatRunsOnItsOwnModelAndEffort() throws {
+        let claude = SecondOpinion.arguments(for: .init(agent: .claudeCode, model: "sonnet", effort: "high"), prompt: "p")
+        #expect(claude.contains(["--model", "sonnet"]) && claude.contains(["--effort", "high"]))
+        let codex = SecondOpinion.arguments(for: .init(agent: .codex, model: "gpt-5.6-sol", effort: "xhigh"), prompt: "p")
+        #expect(codex.contains(["--model", "gpt-5.6-sol"]))
+        #expect(codex.contains(["-c", #"model_reasoning_effort="xhigh""#]))
+        #expect(codex.last == "p")
+        let copilot = SecondOpinion.arguments(for: .init(agent: .copilot, model: "gpt-5.4", effort: "low"), prompt: "p")
+        #expect(copilot.contains(["--model", "gpt-5.4"]) && copilot.contains(["--effort", "low"]))
+        let plain = SecondOpinion.arguments(for: .codex, prompt: "p")
+        #expect(!plain.contains("--model"))
+        #expect(!plain.contains { $0.hasPrefix("model_reasoning_effort") })
+    }
+
+    @Test func independenceIsMeasuredAgainstTheAuthorsModel() {
+        let author = SecondOpinion.Reviewer(agent: .claudeCode, model: "opus", effort: "high")
+        func level(_ agent: AgentKind, _ model: String?) -> SecondOpinion.Independence {
+            SecondOpinion.independence(of: .init(agent: agent, model: model), from: author)
+        }
+        #expect(level(.codex, "gpt-5.6-sol") == .differentMaker)
+        #expect(level(.copilot, "gpt-5.4") == .differentMaker)
+        #expect(level(.copilot, "claude-sonnet-5") == .otherModel)
+        #expect(level(.claudeCode, "sonnet") == .otherModel)
+        #expect(level(.claudeCode, "opus") == .sameModel)
+        #expect(level(.copilot, "claude-opus-5") == .sameModel)
+        #expect(level(.copilot, nil) == .unknown)
+        #expect(level(.copilot, "auto") == .unknown)
+        let onDefault = SecondOpinion.Reviewer(agent: .claudeCode)
+        #expect(SecondOpinion.independence(of: onDefault, from: onDefault) == .sameModel)
+    }
+
+    @Test func aSeatIsNamedByItsModelAndEffort() {
+        let seat = SecondOpinion.Reviewer(agent: .codex, model: "gpt-5.6-sol", effort: "high")
+        #expect(seat.label() == "Codex on Sol high")
+        #expect(seat.seatLabel == "Sol high")
+        #expect(SecondOpinion.Reviewer(agent: .codex).seatLabel == nil)
+        let findings = [SecondOpinion.Finding(file: "Sources/App.swift", line: 11, comment: "Crashes.")]
+        let comment = SecondOpinion.comments(from: findings, patches: [patch], agent: .codex, model: seat.seatLabel)
+        #expect(comment.first?.authorName == "Codex on Sol high")
+    }
+
+    @Test func theUsualLineupIsRemembered() throws {
+        let defaults = try #require(UserDefaults(suiteName: "lineup-\(UUID().uuidString)"))
+        #expect(Preferences.secondOpinionLineup(in: defaults).isEmpty)
+        let lineup = [SecondOpinion.Reviewer(agent: .codex, model: "gpt-5.6-sol", effort: "high"),
+                      SecondOpinion.Reviewer(agent: .copilot, model: "claude-sonnet-5")]
+        Preferences.setSecondOpinionLineup(lineup, in: defaults)
+        #expect(Preferences.secondOpinionLineup(in: defaults) == lineup)
+    }
+
+    @Test func aLineupTakesAsLongAsItsSlowestSeat() {
+        #expect(SecondOpinion.minutes(for: "low") < SecondOpinion.minutes(for: "xhigh"))
+        #expect(SecondOpinion.minutes(for: nil) == SecondOpinion.minutes(for: "high"))
     }
 
     @Test func noReviewerGetsThePersonsMCPServersOrWriteAccess() throws {

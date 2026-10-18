@@ -160,6 +160,10 @@ struct ReviewTarget {
     let sessionID: UUID
     let agent: AgentKind
     let reviews: ReviewCommentStore
+    // The model and effort the session's agent works on, which a reviewer's independence
+    // is measured against.
+    var authorModel: String? = nil
+    var authorEffort: String? = nil
     // Where each agent's CLI is, for asking one for a second opinion. Nil for one that
     // is not installed.
     var executable: (AgentKind) -> String? = { _ in nil }
@@ -170,6 +174,8 @@ struct ReviewTarget {
     var openChat: () -> Void = {}
     // What a side copy needs from the session to answer a question.
     var conversation: () -> ReviewConversation? = { nil }
+
+    var author: SecondOpinion.Reviewer { .init(agent: agent, model: authorModel, effort: authorEffort) }
 }
 
 // The session as a side copy sees it: the folder it runs in, Claude's id for its
@@ -244,7 +250,7 @@ struct ChangesView: View {
     // The second opinion dialog showing progress or findings, so a reviewer finishing
     // while it is open does not also raise a toast behind it.
     @State private var secondOpinionDialog: UUID?
-    @State private var pickerReviewers: Set<AgentKind> = []
+    @State private var pickerLineup: [SecondOpinion.Reviewer] = []
     @State private var pickerScope = SecondOpinionScopeChoice.all
     // An unplaced comment waiting for a line number to be clicked to move onto.
     @State private var reattaching: UUID?
@@ -2584,21 +2590,21 @@ struct ChangesView: View {
     private func reportFinishedRuns(old: [SecondOpinionRun], new: [SecondOpinionRun]) {
         guard let review else { return }
         for run in new where !run.isRunning {
-            guard old.first(where: { $0.agent == run.agent })?.isRunning == true else { continue }
+            guard old.first(where: { $0.reviewer == run.reviewer })?.isRunning == true else { continue }
             if secondOpinionDialog != nil, dialogs.current?.id == secondOpinionDialog {
-                announce("\(run.agent.title) finished its review")
+                announce("\(run.reviewer.label()) finished its review")
                 continue
             }
             switch run.state {
             case .finished(let found) where found > 0:
-                showToast("\(run.agent.title) found \(counted(found, "thing")) to look at", action: "Look at them") {
-                    openFindings(review, from: run.agent)
+                showToast("\(run.reviewer.label()) found \(counted(found, "thing")) to look at", action: "Look at them") {
+                    openFindings(review, from: run.reviewer)
                 }
             case .finished:
-                showToast("\(run.agent.title) found nothing worth raising")
+                showToast("\(run.reviewer.label()) found nothing worth raising")
             case .failed:
-                showToast("\(run.agent.title) could not finish the review", action: "Try again") {
-                    review.reviews.retrySecondOpinion(review.sessionID, agent: run.agent)
+                showToast("\(run.reviewer.label()) could not finish the review", action: "Try again") {
+                    review.reviews.retrySecondOpinion(review.sessionID, reviewer: run.reviewer)
                 }
             case .running:
                 break
@@ -2627,10 +2633,10 @@ struct ChangesView: View {
 
     private func openAsk(_ review: ReviewTarget) {
         let installed = AgentKind.allCases.filter { review.executable($0) != nil }
-        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
-        if pickerReviewers.isEmpty {
-            // Another agent than the session's own is the useful default.
-            pickerReviewers = Set(installed.filter { $0 != review.agent }.prefix(1))
+        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.reviewer))
+        if pickerLineup.isEmpty {
+            // With no saved lineup the dialog seats a first reviewer itself.
+            pickerLineup = Preferences.secondOpinionLineup().filter { installed.contains($0.agent) }
         }
         let canReadSince = review.reviews.latestTrees(review.sessionID) != nil
         if pickerScope == .sinceReview, !canReadSince { pickerScope = .all }
@@ -2641,15 +2647,15 @@ struct ChangesView: View {
         secondOpinionDialog = nil
         dialogs.show(Dialog(
             title: "Ask for a second opinion",
-            content: AnyView(SecondOpinionAskView(
-                sessionAgent: review.agent, installed: installed, running: running,
-                reviewers: pickerReviewers, focus: navigation.secondOpinionFocus, scope: pickerScope,
+            content: AnyView(ChangesOpinionAsk(
+                author: review.author, installed: installed, running: running,
+                lineup: pickerLineup, focus: navigation.secondOpinionFocus, scope: pickerScope,
                 fileCount: changed, fileName: selected?.fileName, canReadSince: canReadSince,
-                ask: { reviewers, focus, scope in
-                    pickerReviewers = reviewers
+                ask: { lineup, focus, scope in
+                    pickerLineup = lineup
                     navigation.secondOpinionFocus = focus
                     pickerScope = scope
-                    askForSecondOpinion(review, agents: reviewers)
+                    askForSecondOpinion(review, lineup: lineup)
                 })),
             actions: [], width: 620, framesItself: true))
     }
@@ -2661,25 +2667,25 @@ struct ChangesView: View {
             title: "Second opinion",
             content: AnyView(SecondOpinionProgressView(
                 review: review,
-                stop: { agent in
-                    reviews.stopSecondOpinion(sessionID, agent: agent)
-                    announce("Stopped \(agent.title)'s review")
+                stop: { reviewer in
+                    reviews.stopSecondOpinion(sessionID, reviewer: reviewer)
+                    announce("Stopped \(reviewer.label())'s review")
                 },
                 stopAll: {
                     reviews.stopSecondOpinion(sessionID)
                     announce("Stopped every review")
                 },
-                lookAt: { agent in openFindings(review, from: agent) })),
+                lookAt: { reviewer in openFindings(review, from: reviewer) })),
             actions: [], width: 580, framesItself: true)
         secondOpinionDialog = dialog.id
         dialogs.show(dialog)
     }
 
     // Opens on the first finding still to look at, from one reviewer when asked.
-    private func openFindings(_ review: ReviewTarget, from agent: AgentKind? = nil) {
+    private func openFindings(_ review: ReviewTarget, from reviewer: SecondOpinion.Reviewer? = nil) {
         let list = SecondOpinionFindings.ordered(review.reviews.findings(review.sessionID))
-        let first = list.first { $0.isPending && (agent == nil || $0.reviewers.contains(agent!)) }
-            ?? list.first { agent == nil || $0.reviewers.contains(agent!) }
+        let first = list.first { $0.isPending && (reviewer == nil || $0.raised(by: reviewer!)) }
+            ?? list.first { reviewer == nil || $0.raised(by: reviewer!) }
         let dialog = Dialog(
             title: "Findings",
             content: AnyView(SecondOpinionFindingsView(review: review, selected: first?.id)),
@@ -2688,31 +2694,33 @@ struct ChangesView: View {
         dialogs.show(dialog)
     }
 
-    private func askForSecondOpinion(_ review: ReviewTarget, agents: Set<AgentKind>) {
+    private func askForSecondOpinion(_ review: ReviewTarget, lineup: [SecondOpinion.Reviewer]) {
         let scope: SecondOpinionRequest.Scope
         switch pickerScope {
         case .all: scope = .all
         case .file: scope = selected.map { .file(root: repoRoot, path: $0.path) } ?? .all
         case .sinceReview: scope = review.reviews.latestTrees(review.sessionID).map { .sinceReview(trees: $0) } ?? .all
         }
-        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
-        let chosen = AgentKind.allCases.filter { agents.contains($0) && !running.contains($0) }
+        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.reviewer))
+        var seen = Set<SecondOpinion.Reviewer>()
+        let chosen = lineup.filter { !running.contains($0) && seen.insert($0).inserted }
         review.reviews.beginSecondOpinion(review.sessionID)
-        startSecondOpinion(review, agents: chosen, scope: scope)
+        startSecondOpinion(review, reviewers: chosen, scope: scope)
         openProgress(review)
     }
 
-    private func startSecondOpinion(_ review: ReviewTarget, agents: [AgentKind], scope: SecondOpinionRequest.Scope) {
-        var asked: [AgentKind] = []
-        for agent in agents {
-            guard let executable = review.executable(agent) else { continue }
-            review.reviews.startSecondOpinion(review.sessionID, agent: agent, request: SecondOpinionRequest(
+    private func startSecondOpinion(_ review: ReviewTarget, reviewers: [SecondOpinion.Reviewer],
+                                    scope: SecondOpinionRequest.Scope) {
+        var asked: [String] = []
+        for reviewer in reviewers {
+            guard let executable = review.executable(reviewer.agent) else { continue }
+            review.reviews.startSecondOpinion(review.sessionID, reviewer: reviewer, request: SecondOpinionRequest(
                 focus: SecondOpinion.Focus.allCases.filter(navigation.secondOpinionFocus.contains),
                 scope: scope, repositories: reviewRepositories, executable: executable))
-            asked.append(agent)
+            asked.append(reviewer.label())
         }
         guard !asked.isEmpty else { return }
-        announce("Asked \(asked.map(\.title).joined(separator: " and ")) for a second opinion")
+        announce("Asked \(asked.joined(separator: " and ")) for a second opinion")
     }
 
     // The open project leads, so the reviewer starts in the folder the session works in.

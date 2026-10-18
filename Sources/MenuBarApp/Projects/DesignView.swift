@@ -37,6 +37,8 @@ struct DesignView: View {
     // When a prompt last left this composer, so the bubble it becomes can lift into place.
     @State private var promptSentAt: Date?
     @State private var designWindow = DesignWindow()
+    // The note whose pin and card are lit, from hovering either.
+    @State private var hotNote: UUID?
 
     var body: some View {
         if let session = store.session(sessionID),
@@ -544,6 +546,11 @@ struct DesignView: View {
                         : "Open design in a separate window")
                     .accessibilityLabel("Full screen")
 
+                    SecondOpinionButton(usual: Preferences.secondOpinionLineup().map(\.agent)) {
+                        askForSecondOpinion(session, directory: directory)
+                    }
+                    .appTooltip("Ask other agents to look at every screen")
+
                     if let implementation {
                         if onOpenImplementation == nil {
                             ActionButton(title: "Build", tone: .outlined,
@@ -576,22 +583,30 @@ struct DesignView: View {
                 }
             }
 
-            GeometryReader { geometry in
-                let toolbarHeight = canvas.revision != nil && canvas.screenURL(in: directory) != nil
-                    ? DesignWebView.toolbarHeight : 0
-                let workspace = CGSize(width: geometry.size.width,
-                                       height: max(0, geometry.size.height - toolbarHeight))
-                // A sibling rather than an overlay of the canvas: an overlay is rebuilt each
-                // time the canvas switches between its placeholders and the page, which would
-                // throw away the composer, its focus and the transcript's scroll position.
-                ZStack(alignment: .bottom) {
-                    canvasContent(session, directory: directory, busy: busy)
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                    floatingConversation(session, size: workspace)
-                        .padding(DesignConversationLayout.inset(in: workspace))
-                        .padding(.bottom, toolbarHeight)
+            HStack(spacing: 0) {
+                GeometryReader { geometry in
+                    let toolbarHeight = canvas.revision != nil && canvas.screenURL(in: directory) != nil
+                        ? DesignWebView.toolbarHeight : 0
+                    let workspace = CGSize(width: geometry.size.width,
+                                           height: max(0, geometry.size.height - toolbarHeight))
+                    // A sibling rather than an overlay of the canvas: an overlay is rebuilt each
+                    // time the canvas switches between its placeholders and the page, which would
+                    // throw away the composer, its focus and the transcript's scroll position.
+                    ZStack(alignment: .bottom) {
+                        canvasContent(session, directory: directory, busy: busy)
+                            .frame(width: geometry.size.width, height: geometry.size.height)
+                        floatingConversation(session, size: workspace)
+                            .padding(DesignConversationLayout.inset(in: workspace))
+                            .padding(.bottom, toolbarHeight)
+                    }
+                }
+                if let opinion = runner.designOpinions.opinion(sessionID) {
+                    opinionPanel(opinion)
+                        .frame(width: 320)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
+            .motion(Motion.reveal, value: runner.designOpinions.opinion(sessionID) == nil)
         }
     }
 
@@ -609,7 +624,11 @@ struct DesignView: View {
                           snapshotRequest: snapshotRequest,
                           onSelection: selectElement,
                           onSnapshot: receiveSnapshot,
-                          onViewport: { runner.recordCanvasWidth($0, for: sessionID) })
+                          onViewport: { runner.recordCanvasWidth($0, for: sessionID) },
+                          pins: pins,
+                          hotPin: hotNote?.uuidString,
+                          onPin: { hotNote = UUID(uuidString: $0) },
+                          onPinHover: { id in hotNote = id.flatMap(UUID.init(uuidString:)) })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.white)
         } else if busy {
@@ -662,6 +681,81 @@ struct DesignView: View {
                                      additionalContext: request.additionalContext)
             }
         }
+    }
+
+    // MARK: - Second opinion
+
+    // The notes on the screen in view, as pins. With one screen, a note that names no
+    // screen it knows is still about this one.
+    private var pins: [DesignPin] {
+        guard let opinion = runner.designOpinions.opinion(sessionID) else { return [] }
+        let current = canvas.selectedScreen?.id
+        let known = Set(canvas.manifest.screens.map(\.id))
+        return opinion.notes.enumerated().compactMap { index, note in
+            let here = note.screen == current
+                || (canvas.manifest.screens.count == 1 && note.screen.map { !known.contains($0) } == true)
+            guard here, note.selector != nil || note.box != nil else { return nil }
+            return DesignPin(id: note.id.uuidString, selector: note.selector, box: note.box,
+                             severity: note.severity.rawValue, number: index + 1,
+                             label: "Note \(index + 1), \(note.category): \(note.text)")
+        }
+    }
+
+    private func askForSecondOpinion(_ session: ChatSession, directory: URL) {
+        let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
+        let author = runner.author(of: session)
+        let screens = canvas.manifest.screens
+        dialogs.show(Dialog(
+            title: "Ask for a second opinion",
+            content: AnyView(DesignOpinionAsk(
+                screenCount: screens.count, author: author, installed: installed,
+                ask: { lineup, focus, reading in
+                    dialogs.dismiss()
+                    let executables = Dictionary(uniqueKeysWithValues: installed.compactMap { agent in
+                        runner.executable(for: agent).map { (agent, $0) }
+                    })
+                    let shots = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("code-station-design-review-\(UUID().uuidString)", isDirectory: true)
+                    let asked = session.messages.filter { $0.role == .user }.suffix(3).reversed()
+                        .map(\.text).joined(separator: "\n\n")
+                    runner.designOpinions.ask(
+                        DesignSecondOpinion.Request(focus: focus, reading: reading,
+                                                    designDirectory: directory.path, shotsDirectory: shots.path,
+                                                    shots: [], asked: asked,
+                                                    conversation: reading.conversation
+                                                        ? SideQuestion.recentChat(session.messages) : "",
+                                                    executable: ""),
+                        screens: screens, reviewers: lineup, executables: executables, in: sessionID)
+                })),
+            actions: [], width: 620, framesItself: true))
+    }
+
+    private func opinionPanel(_ opinion: DesignOpinion) -> some View {
+        let opinions = runner.designOpinions
+        return DesignOpinionPanel(
+            opinion: opinion, screens: canvas.manifest.screens, currentScreen: canvas.selectedScreen?.id,
+            hotNote: $hotNote,
+            showScreen: { canvas.select($0) },
+            keep: { opinions.keep($0, in: sessionID) },
+            edit: { opinions.edit($0, text: $1, in: sessionID) },
+            dismissNote: { opinions.dismiss($0, in: sessionID) },
+            send: {
+                let names = Array(NSOrderedSet(array: opinion.lanes.map(\.reviewer.agent.title))) as? [String] ?? []
+                let text = DesignSecondOpinion.feedback(opinion.kept, screens: canvas.manifest.screens,
+                                                        names: names.joined(separator: " and "))
+                runner.send(text, sessionID: sessionID, store: store)
+                opinions.markSent(count: opinion.kept.count, in: sessionID)
+                promptSentAt = Date()
+            },
+            retry: { seat in
+                guard let executable = runner.executable(for: seat.agent) else { return }
+                opinions.retry(seat, executable: executable, in: sessionID)
+            },
+            stop: { opinions.stop($0, in: sessionID) },
+            close: {
+                hotNote = nil
+                opinions.dismiss(sessionID)
+            })
     }
 
     // MARK: - Implementation
@@ -922,6 +1016,11 @@ final class DesignCanvas {
     }
 
     func reload() { reloadGeneration += 1 }
+
+    func select(_ screenID: String) {
+        guard manifest.screens.contains(where: { $0.id == screenID }) else { return }
+        selectedScreenID = screenID
+    }
 
     func refresh(_ directory: URL) {
         let next = DesignArtifactRevision.read(directory)

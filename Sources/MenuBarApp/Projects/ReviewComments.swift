@@ -72,6 +72,9 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
     struct Voice: Codable, Equatable, Sendable {
         var agent: AgentKind
         var body: String
+        var model: String? = nil
+
+        var name: String { model.map { agent.title + " on " + $0 } ?? agent.title }
     }
 
     var id = UUID()
@@ -91,6 +94,9 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
     var kind: Kind = .change
     var severity: Severity?
     var also: [Voice] = []
+    // The model and effort a reviewer ran on, as in "Sol high". Nil for one that ran on
+    // whatever its agent is set to use.
+    var reviewerModel: String?
     // Kept after the person rewrote it, so the card says the words are partly theirs.
     var edited = false
     // Its code left the diff and the person chose to keep it on the file as a whole.
@@ -136,6 +142,7 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
         kind = try values.decodeIfPresent(Kind.self, forKey: .kind) ?? .change
         severity = try values.decodeIfPresent(Severity.self, forKey: .severity)
         also = try values.decodeIfPresent([Voice].self, forKey: .also) ?? []
+        reviewerModel = try values.decodeIfPresent(String.self, forKey: .reviewerModel)
         edited = try values.decodeIfPresent(Bool.self, forKey: .edited) ?? false
         onFile = try values.decodeIfPresent(Bool.self, forKey: .onFile) ?? false
         questionID = try values.decodeIfPresent(UUID.self, forKey: .questionID)
@@ -151,13 +158,24 @@ struct ReviewComment: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
+    // Every reviewer that raised these lines with the model it ran on, the first one first.
+    var voices: [Voice] {
+        (reviewer.map { [Voice(agent: $0, body: body, model: reviewerModel)] } ?? []) + also
+    }
+
     // Every reviewer that raised these lines, the first one first.
     var reviewers: [AgentKind] { (reviewer.map { [$0] } ?? []) + also.map(\.agent) }
+
+    func raised(by seat: SecondOpinion.Reviewer) -> Bool {
+        voices.contains { $0.agent == seat.agent && $0.model == seat.seatLabel }
+    }
 
     var authorName: String {
         switch author {
         case .you: "You"
-        case .agent: reviewers.map(\.title).joined(separator: " and ")
+        case .agent(let agent):
+            also.isEmpty ? Voice(agent: agent, body: body, model: reviewerModel).name
+                : reviewers.map(\.title).joined(separator: " and ")
         }
     }
 
@@ -547,7 +565,7 @@ struct SecondOpinionRun: Equatable, Identifiable {
         case failed(String)
     }
 
-    var agent: AgentKind
+    var reviewer: SecondOpinion.Reviewer
     var started: Date
     var ended: Date?
     var state: State = .running
@@ -556,7 +574,8 @@ struct SecondOpinionRun: Equatable, Identifiable {
     var recent = ["Gathering the changes"]
     var request: SecondOpinionRequest
 
-    var id: AgentKind { agent }
+    var agent: AgentKind { reviewer.agent }
+    var id: SecondOpinion.Reviewer { reviewer }
     var isRunning: Bool { state == .running }
 }
 
@@ -711,7 +730,7 @@ final class ReviewCommentStore {
     // answer can show what the agent changed. Kept only while the app runs.
     @ObservationIgnored private var sentTexts: [UUID: [String: String]] = [:]
 
-    @ObservationIgnored private var tasks: [UUID: [AgentKind: Task<Void, Never>]] = [:]
+    @ObservationIgnored private var tasks: [UUID: [SecondOpinion.Reviewer: Task<Void, Never>]] = [:]
     @ObservationIgnored private let url: URL?
     @ObservationIgnored private let roundsURL: URL?
     @ObservationIgnored private let questionsURL: URL?
@@ -906,14 +925,16 @@ final class ReviewCommentStore {
     func addFindings(_ found: [ReviewComment], from agent: AgentKind, to sessionID: UUID) -> Int {
         var added = 0
         for var finding in found {
+            // Two seats of one agent on different models are different voices too.
             let twin = comments[sessionID]?.firstIndex { other in
-                guard let reviewer = other.reviewer, reviewer != agent,
-                      !other.reviewers.contains(agent) else { return false }
+                guard other.reviewer != nil,
+                      !other.voices.contains(where: { $0.agent == agent && $0.model == finding.reviewerModel })
+                else { return false }
                 return other.root == finding.root && other.path == finding.path
                     && other.anchor == finding.anchor
             }
             if let twin {
-                comments[sessionID]?[twin].also.append(.init(agent: agent, body: finding.body))
+                comments[sessionID]?[twin].also.append(.init(agent: agent, body: finding.body, model: finding.reviewerModel))
                 if let severity = finding.severity, let existing = comments[sessionID]?[twin].severity,
                    Self.rank(severity) < Self.rank(existing) {
                     comments[sessionID]?[twin].severity = severity
@@ -954,54 +975,54 @@ final class ReviewCommentStore {
 
     func isReviewing(_ sessionID: UUID) -> Bool { runs(sessionID).contains(where: \.isRunning) }
 
-    func isReviewing(_ sessionID: UUID, agent: AgentKind) -> Bool {
-        runs(sessionID).contains { $0.agent == agent && $0.isRunning }
+    func isReviewing(_ sessionID: UUID, reviewer: SecondOpinion.Reviewer) -> Bool {
+        runs(sessionID).contains { $0.reviewer == reviewer && $0.isRunning }
     }
 
-    // Each reviewer gets a lane of its own and runs alongside the others. One already at
+    // Each seat gets a lane of its own and runs alongside the others. One already at
     // work is left to it.
-    func startSecondOpinion(_ sessionID: UUID, agent: AgentKind, request: SecondOpinionRequest) {
-        guard !isReviewing(sessionID, agent: agent), !request.repositories.isEmpty else { return }
-        let run = SecondOpinionRun(agent: agent, started: Date(), request: request)
-        var lanes = runs(sessionID).filter { $0.agent != agent }
+    func startSecondOpinion(_ sessionID: UUID, reviewer: SecondOpinion.Reviewer, request: SecondOpinionRequest) {
+        guard !isReviewing(sessionID, reviewer: reviewer), !request.repositories.isEmpty else { return }
+        let run = SecondOpinionRun(reviewer: reviewer, started: Date(), request: request)
+        var lanes = runs(sessionID).filter { $0.reviewer != reviewer }
         lanes.append(run)
         runs[sessionID] = lanes
         let searchPath = ProcessManager.searchPath
-        tasks[sessionID, default: [:]][agent] = Task { [weak self] in
+        tasks[sessionID, default: [:]][reviewer] = Task { [weak self] in
             var patches = await SecondOpinion.patches(for: request)
             if case .file(let root, let path) = request.scope {
                 patches = patches.filter { $0.root == root && $0.path == path }
             }
             guard !Task.isCancelled else { return }
-            self?.setActivity("Reading \(counted(patches.count, "changed file"))", agent: agent, in: sessionID)
+            self?.setActivity("Reading \(counted(patches.count, "changed file"))", reviewer: reviewer, in: sessionID)
             let outcome: Result<[ReviewComment], SecondOpinion.Failure>
             if patches.isEmpty {
                 outcome = .failure(.init(message: request.scope.isSinceReview
                     ? "Nothing changed since the last review." : "There are no changes to review."))
             } else {
                 outcome = await SecondOpinion.review(
-                    patches, agent: agent, executable: request.executable, searchPath: searchPath,
+                    patches, reviewer: reviewer, executable: request.executable, searchPath: searchPath,
                     repositories: request.repositories.map { (root: $0.root, name: $0.name) },
                     focus: request.focus, sinceReview: request.scope.isSinceReview,
                     activity: { [weak self] text in
-                        Task { @MainActor in self?.setActivity(text, agent: agent, in: sessionID) }
+                        Task { @MainActor in self?.setActivity(text, reviewer: reviewer, in: sessionID) }
                     })
             }
             guard !Task.isCancelled, let self else { return }
-            self.finishSecondOpinion(sessionID, agent: agent, outcome: outcome)
+            self.finishSecondOpinion(sessionID, reviewer: reviewer, outcome: outcome)
         }
     }
 
-    func retrySecondOpinion(_ sessionID: UUID, agent: AgentKind) {
-        guard let run = runs(sessionID).first(where: { $0.agent == agent }), !run.isRunning else { return }
-        startSecondOpinion(sessionID, agent: agent, request: run.request)
+    func retrySecondOpinion(_ sessionID: UUID, reviewer: SecondOpinion.Reviewer) {
+        guard let run = runs(sessionID).first(where: { $0.reviewer == reviewer }), !run.isRunning else { return }
+        startSecondOpinion(sessionID, reviewer: reviewer, request: run.request)
     }
 
     // Stopping a reviewer drops its lane: there is nothing it came to.
-    func stopSecondOpinion(_ sessionID: UUID, agent: AgentKind) {
-        tasks[sessionID]?[agent]?.cancel()
-        tasks[sessionID]?[agent] = nil
-        runs[sessionID]?.removeAll { $0.agent == agent }
+    func stopSecondOpinion(_ sessionID: UUID, reviewer: SecondOpinion.Reviewer) {
+        tasks[sessionID]?[reviewer]?.cancel()
+        tasks[sessionID]?[reviewer] = nil
+        runs[sessionID]?.removeAll { $0.reviewer == reviewer }
         if runs[sessionID]?.isEmpty == true { runs[sessionID] = nil }
     }
 
@@ -1012,15 +1033,8 @@ final class ReviewCommentStore {
         if runs[sessionID]?.isEmpty == true { runs[sessionID] = nil }
     }
 
-    // A finished lane stays until the person puts it away.
-    func dismissLane(_ sessionID: UUID, agent: AgentKind) {
-        guard runs(sessionID).first(where: { $0.agent == agent })?.isRunning == false else { return }
-        runs[sessionID]?.removeAll { $0.agent == agent }
-        if runs[sessionID]?.isEmpty == true { runs[sessionID] = nil }
-    }
-
-    private func setActivity(_ text: String, agent: AgentKind, in sessionID: UUID) {
-        guard let index = runs[sessionID]?.firstIndex(where: { $0.agent == agent && $0.isRunning }),
+    private func setActivity(_ text: String, reviewer: SecondOpinion.Reviewer, in sessionID: UUID) {
+        guard let index = runs[sessionID]?.firstIndex(where: { $0.reviewer == reviewer && $0.isRunning }),
               var run = runs[sessionID]?[index], run.activity != text else { return }
         run.activity = text
         run.recent = Array((run.recent + [text]).suffix(3))
@@ -1028,11 +1042,11 @@ final class ReviewCommentStore {
     }
 
     // Called by the run when it ends; tests call it directly with what a reviewer said.
-    func finishSecondOpinion(_ sessionID: UUID, agent: AgentKind,
+    func finishSecondOpinion(_ sessionID: UUID, reviewer: SecondOpinion.Reviewer,
                              outcome: Result<[ReviewComment], SecondOpinion.Failure>) {
-        tasks[sessionID]?[agent] = nil
-        if case .success(let found) = outcome { addFindings(found, from: agent, to: sessionID) }
-        guard let index = runs[sessionID]?.firstIndex(where: { $0.agent == agent }) else { return }
+        tasks[sessionID]?[reviewer] = nil
+        if case .success(let found) = outcome { addFindings(found, from: reviewer.agent, to: sessionID) }
+        guard let index = runs[sessionID]?.firstIndex(where: { $0.reviewer == reviewer }) else { return }
         runs[sessionID]?[index].ended = Date()
         switch outcome {
         case .success(let found): runs[sessionID]?[index].state = .finished(found: found.count)

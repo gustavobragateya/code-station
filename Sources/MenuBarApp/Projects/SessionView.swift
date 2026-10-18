@@ -1753,7 +1753,11 @@ struct SessionView: View {
                             showInExplorer: showInExplorer,
                             promptMenu: promptMenu(for: message),
                             arriving: message.isArriving(sentAt: promptSentAt),
-                            bubble: bubble)
+                            bubble: bubble,
+                            secondOpinion: canJudge(message, in: session, state: state) ? {
+                                askForSecondOpinion(on: answerSubject(message, in: session),
+                                                    anchor: message.id, session: session)
+                            } : nil)
                     // Every message is on screen now, and a streaming turn rewrites
                     // the last one many times a second. Without this, each of those
                     // redraws every message in the transcript, parsing its markdown
@@ -1763,6 +1767,10 @@ struct SessionView: View {
                     .environment(\.activeTranscriptTools, runner.runningTools(sessionID))
                     .environment(\.agentTranscriptFocus, agentFocus)
                     .transition(.fadeIn)
+                }
+                ForEach(opinions(after: message.id)) { opinion in
+                    opinionCard(opinion, session: session)
+                        .transition(.fadeIn)
                 }
             }
 
@@ -1955,7 +1963,9 @@ struct SessionView: View {
                 let repositories = directories.map {
                     ReviewRepository(root: $0, name: ($0 as NSString).lastPathComponent)
                 }
-                reviews.startSecondOpinion(sessionID, agent: checker, request: SecondOpinionRequest(
+                let seat = Preferences.secondOpinionLineup().first { $0.agent == checker }
+                    ?? SecondOpinion.Reviewer(agent: checker)
+                reviews.startSecondOpinion(sessionID, reviewer: seat, request: SecondOpinionRequest(
                     scope: .sinceReview(trees: round.trees), repositories: repositories, executable: executable))
                 changesNavigation.showingHistory = false
                 changesNavigation.showingReview = true
@@ -2099,14 +2109,108 @@ struct SessionView: View {
     // happen belongs. The turn is parked until it is answered.
     @ViewBuilder private func pendingQuestion(projectPath: String) -> some View {
         if let request = runner.question(sessionID) {
+            let session = store.session(sessionID)
             PermissionCard(request: request,
-                           workingDirectories: store.session(sessionID)
-                               .map(store.workingDirectories(for:)) ?? [],
-                           projectPath: projectPath) { answer in
+                           workingDirectories: session.map(store.workingDirectories(for:)) ?? [],
+                           projectPath: projectPath,
+                           secondOpinion: session.map { session in
+                               { askForSecondOpinion(on: planSubject(request, in: session),
+                                                     anchor: session.messages.last(where: { !$0.isEmpty })?.id, session: session) }
+                           }) { answer in
                 runner.answer(request, with: answer, sessionID: sessionID, store: store)
             }
             .id(request.id)
+            if let session, let opinion = runner.opinions.opinion(on: Self.planID(request), in: sessionID) {
+                opinionCard(opinion, session: session)
+                    .transition(.fadeIn)
+            }
         }
+    }
+
+    // MARK: - Second opinion in Chat
+
+    private static func planID(_ request: PermissionRequest) -> String { "plan:" + request.id }
+
+    // The plan waiting on an answer, judged against the request that led to it.
+    private func planSubject(_ request: PermissionRequest, in session: ChatSession) -> ChatSecondOpinion.Subject {
+        ChatSecondOpinion.Subject(kind: .plan, id: Self.planID(request), text: request.subject,
+                                  request: session.messages.last(where: { $0.role == .user })?.text ?? "")
+    }
+
+    private func answerSubject(_ message: ChatMessage, in session: ChatSession) -> ChatSecondOpinion.Subject {
+        let index = session.messages.firstIndex { $0.id == message.id } ?? session.messages.endIndex
+        let asked = session.messages[..<index].last { $0.role == .user }?.text ?? ""
+        return ChatSecondOpinion.Subject(kind: .answer, id: "answer:" + message.id.uuidString,
+                                         text: message.text, request: asked)
+    }
+
+    // An answer can be judged once it is whole: not while its turn is still writing it.
+    private func canJudge(_ message: ChatMessage, in session: ChatSession, state: SessionState) -> Bool {
+        guard message.role == .assistant, !message.text.isBlank else { return false }
+        return !(state.isBusy && session.messages.last?.id == message.id)
+    }
+
+    // Cards joined to a message. The one on a plan still waiting sits under the plan.
+    private func opinions(after messageID: UUID) -> [ChatOpinion] {
+        let pending = runner.question(sessionID).map(Self.planID)
+        return runner.opinions.opinions(sessionID).filter { $0.anchor == messageID && $0.subject.id != pending }
+    }
+
+    private func askForSecondOpinion(on subject: ChatSecondOpinion.Subject, anchor: UUID?, session: ChatSession) {
+        let installed = AgentKind.allCases.filter { runner.executable(for: $0) != nil }
+        let author = runner.author(of: session)
+        dialogs.show(Dialog(
+            title: "Ask for a second opinion",
+            content: AnyView(ChatOpinionAsk(
+                subject: subject, author: author, installed: installed,
+                ask: { lineup, focus, reading in
+                    dialogs.dismiss()
+                    let executables = Dictionary(uniqueKeysWithValues: installed.compactMap { agent in
+                        runner.executable(for: agent).map { (agent, $0) }
+                    })
+                    runner.opinions.ask(
+                        ChatSecondOpinion.Request(subject: subject, focus: focus, reading: reading,
+                                                  conversation: reading.conversation
+                                                    ? SideQuestion.recentChat(session.messages) : "",
+                                                  directories: store.workingDirectories(for: session),
+                                                  executable: ""),
+                        reviewers: lineup, executables: executables, anchor: anchor, in: sessionID)
+                })),
+            actions: [], width: 620, framesItself: true))
+    }
+
+    private func opinionCard(_ opinion: ChatOpinion, session: ChatSession) -> some View {
+        let pending = runner.question(sessionID).flatMap { Self.planID($0) == opinion.subject.id ? $0 : nil }
+        let opinions = runner.opinions
+        return ChatOpinionCard(
+            opinion: opinion, authorTitle: session.agent.title, planPending: pending != nil,
+            toggle: { opinions.toggle($0, of: opinion.id, in: sessionID) },
+            send: {
+                let names = Array(NSOrderedSet(array: opinion.lanes.map(\.reviewer.agent.title))) as? [String] ?? []
+                let text = ChatSecondOpinion.feedback(opinion.ticked, subject: opinion.subject,
+                                                      names: names.joined(separator: " and "))
+                // A plan still waiting goes back as its answer, so the agent keeps
+                // planning with the points in mind rather than being told no.
+                if let pending {
+                    runner.answer(pending, with: .revise(text), sessionID: sessionID, store: store)
+                } else {
+                    runner.send(text, sessionID: sessionID, store: store)
+                }
+                opinions.markSent(opinion.id, count: opinion.ticked.count, in: sessionID)
+            },
+            approve: {
+                guard let pending else { return }
+                runner.answer(pending, with: .allowOnce, sessionID: sessionID, store: store)
+            },
+            askAgain: {
+                askForSecondOpinion(on: opinion.subject, anchor: opinion.anchor, session: session)
+            },
+            retry: { seat in
+                guard let executable = runner.executable(for: seat.agent) else { return }
+                opinions.retry(seat, of: opinion.id, executable: executable, in: sessionID)
+            },
+            stop: { opinions.stop($0, of: opinion.id, in: sessionID) },
+            dismiss: { opinions.dismiss(opinion.id, in: sessionID) })
     }
 
     // A running turn shows the row for as long as it runs, whatever the transcript looks

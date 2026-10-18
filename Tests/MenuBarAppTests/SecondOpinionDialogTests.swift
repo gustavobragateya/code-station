@@ -15,7 +15,7 @@ struct SecondOpinionDialogTests {
     }
 
     private func run(_ agent: AgentKind, _ state: SecondOpinionRun.State) -> SecondOpinionRun {
-        var run = SecondOpinionRun(agent: agent, started: Date(timeIntervalSince1970: 100),
+        var run = SecondOpinionRun(reviewer: SecondOpinion.Reviewer(agent: agent), started: Date(timeIntervalSince1970: 100),
                                    request: SecondOpinionRequest(repositories: [], executable: "/bin/true"))
         run.state = state
         return run
@@ -112,9 +112,9 @@ struct SecondOpinionDialogTests {
         let session = UUID()
         let request = SecondOpinionRequest(repositories: [ReviewRepository(root: scratch.path, name: "App")],
                                            executable: "/usr/bin/false")
-        store.startSecondOpinion(session, agent: .copilot, request: request)
+        store.startSecondOpinion(session, reviewer: SecondOpinion.Reviewer(agent: .copilot), request: request)
         store.beginSecondOpinion(session)
-        #expect(store.isReviewing(session, agent: .copilot))
+        #expect(store.isReviewing(session, reviewer: SecondOpinion.Reviewer(agent: .copilot)))
         #expect(await waitUntil { store.runs(session).first?.isRunning == false })
 
         store.beginSecondOpinion(session)

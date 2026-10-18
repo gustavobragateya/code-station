@@ -54,6 +54,107 @@ enum SecondOpinion {
         }
     }
 
+    // One seat in the lineup: an agent on a model, thinking at an effort. Nil model or
+    // effort means whatever that agent is set to use. The same agent can sit twice on
+    // different models, so the seat as a whole is what tells two runs apart.
+    struct Reviewer: Hashable, Codable, Sendable {
+        var agent: AgentKind
+        var model: String?
+        var effort: String?
+
+        static let maxSeats = 4
+
+        // "Sol high": what a finding adds after the agent's name. Nil when the seat runs
+        // on whatever its agent is set to use.
+        var seatLabel: String? {
+            let full = label()
+            return full == agent.title ? nil : String(full.dropFirst(agent.title.count + " on ".count))
+        }
+
+        // "Codex on Sol high", the way a finding names who raised it.
+        func label(modelTitle: (String) -> String = { ModelChoice.title(of: $0) }) -> String {
+            let words = [model.map(modelTitle), effort.map { EffortChoice.summary(of: $0, agent: agent).lowercased() }]
+                .compactMap { $0 }
+            return words.isEmpty ? agent.title : agent.title + " on " + words.joined(separator: " ")
+        }
+    }
+
+    // How far a reviewer stands from the agent that did the work. A reviewer from another
+    // maker shares the fewest blind spots; the author's own model, even on a fresh start,
+    // tends to agree with itself. Unknown is a reviewer whose model is picked for it.
+    enum Independence: Equatable, Sendable {
+        case differentMaker, otherModel, sameModel, unknown
+
+        // Lit steps on the three-step meter. Unknown lights none and is drawn dashed.
+        var steps: Int {
+            switch self {
+            case .differentMaker: 3
+            case .otherModel: 2
+            case .sameModel: 1
+            case .unknown: 0
+            }
+        }
+
+        var line: String {
+            switch self {
+            case .differentMaker: "Different maker. Best at catching what the author missed."
+            case .otherModel: "Same maker, different model."
+            case .sameModel: "Same model as the author, fresh start. Tends to agree with itself."
+            case .unknown: "Copilot picks the model, so how independent it is can change."
+            }
+        }
+    }
+
+    static func independence(of reviewer: Reviewer, from author: Reviewer) -> Independence {
+        guard let theirs = maker(of: reviewer), let ours = maker(of: author) else { return .unknown }
+        guard theirs == ours else { return .differentMaker }
+        switch (reviewer.model.map(modelKey), author.model.map(modelKey)) {
+        case (nil, nil): return reviewer.agent == author.agent ? .sameModel : .otherModel
+        case (let a?, let b?): return a == b ? .sameModel : .otherModel
+        default: return .otherModel
+        }
+    }
+
+    // Who trained the model a seat runs on. Copilot serves several makers' models, and
+    // on its default or Auto it chooses one itself, so there is no saying.
+    static func maker(of reviewer: Reviewer) -> String? {
+        switch reviewer.agent {
+        case .claudeCode: return "anthropic"
+        case .codex: return "openai"
+        case .copilot:
+            guard let model = reviewer.model?.lowercased(), model != "auto" else { return nil }
+            if model.hasPrefix("claude") { return "anthropic" }
+            if model.hasPrefix("gpt") || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
+                return "openai"
+            }
+            if model.hasPrefix("gemini") { return "google" }
+            return nil
+        }
+    }
+
+    // A model's name without the parts that differ between CLIs for the same model:
+    // Claude Code's "opus" and Copilot's "claude-opus-5" are one model family.
+    static func modelKey(_ id: String) -> String {
+        var name = id.lowercased()
+        if let bracket = name.firstIndex(of: "[") { name = String(name[..<bracket]) }
+        if name.hasPrefix("claude-") { name = String(name.dropFirst("claude-".count)) }
+        if let family = ["opus", "sonnet", "haiku", "fable"].first(where: { name.hasPrefix($0) }) { return family }
+        return name
+    }
+
+    // A rough wait for one seat, by how hard it is asked to think. None of the CLIs say
+    // beforehand, so this only sets expectations. Seats run side by side, so a lineup
+    // takes as long as its slowest seat.
+    static func minutes(for effort: String?) -> Int {
+        switch effort {
+        case "none", "minimal", "low": 2
+        case "medium": 3
+        case "high", nil: 4
+        case "xhigh": 6
+        default: 8
+        }
+    }
+
     // A prompt is passed on the command line, and a huge diff would not fit there or in a
     // reviewer's attention. Files past this budget are named without their patch.
     static let patchBudget = 120_000
@@ -172,11 +273,13 @@ enum SecondOpinion {
     // is stopped by the agent rather than by the prompt. None of them gets the MCP servers
     // the person has set up either: any one of those can write, and none is needed to read
     // a diff.
-    static func arguments(for agent: AgentKind, prompt: String,
+    // The model and effort go in with the same flags a session launch uses.
+    static func arguments(for reviewer: Reviewer, prompt: String,
                           addDirectories: [String] = [],
                           codexServers: [DisabledMCPServer] = [],
                           copilotServers: [String] = []) -> [String] {
-        switch agent {
+        let model = reviewer.model.map { ["--model", $0] } ?? []
+        switch reviewer.agent {
         case .claudeCode:
             // Streamed like the others, so its lane can say what it is reading.
             return ["-p", prompt, "--output-format", "stream-json", "--verbose",
@@ -184,6 +287,7 @@ enum SecondOpinion {
              "--allowedTools", "Read,Grep,Glob",
              "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash",
              "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#]
+                + model + (reviewer.effort.map { ["--effort", $0] } ?? [])
                 + (addDirectories.isEmpty ? [] : ["--add-dir"] + addDirectories)
         case .codex:
             var arguments = ["exec", "--json", "--skip-git-repo-check",
@@ -192,9 +296,10 @@ enum SecondOpinion {
             if let override = AgentLaunchConfiguration.disabledMCPServersOverride(codexServers) {
                 arguments += ["-c", override]
             }
+            if let effort = reviewer.effort { arguments += ["-c", "model_reasoning_effort=\"\(effort)\""] }
             // Read-only already permits reads outside the working directory. --add-dir
             // configures writable roots, which a review does not need.
-            return arguments + [prompt]
+            return arguments + model + [prompt]
         case .copilot:
             // Copilot remembers what was allowed in a folder from one run to the next, and
             // a denial outranks every allowance, so writes and the shell are denied outright.
@@ -202,8 +307,17 @@ enum SecondOpinion {
              "--no-ask-user", "--disable-builtin-mcps", "--log-level", "none",
              "--deny-tool=shell", "--deny-tool=write"]
                 + copilotServers.flatMap { ["--disable-mcp-server", $0, "--deny-tool=\($0)"] }
+                + model + (reviewer.effort.map { ["--effort", $0] } ?? [])
                 + addDirectories.flatMap { ["--add-dir", $0] }
         }
+    }
+
+    static func arguments(for agent: AgentKind, prompt: String,
+                          addDirectories: [String] = [],
+                          codexServers: [DisabledMCPServer] = [],
+                          copilotServers: [String] = []) -> [String] {
+        arguments(for: Reviewer(agent: agent), prompt: prompt, addDirectories: addDirectories,
+                  codexServers: codexServers, copilotServers: copilotServers)
     }
 
     // The servers in Copilot's own MCP configuration, which it loads on every run and has
@@ -216,17 +330,18 @@ enum SecondOpinion {
         return servers.keys.sorted()
     }
 
-    static func review(_ patches: [Patch], agent: AgentKind, executable: String,
+    static func review(_ patches: [Patch], reviewer: Reviewer, executable: String,
                        searchPath: String, repositories: [(root: String, name: String)],
                        focus: [Focus] = Focus.standard, sinceReview: Bool = false,
                        activity: @escaping @Sendable (String) -> Void = { _ in }) async -> Result<[ReviewComment], Failure> {
+        let agent = reviewer.agent
         guard let directory = repositories.first?.root else {
             return .failure(Failure(message: "There is no project to review."))
         }
         let prompt = prompt(for: patches, repositories: repositories, focus: focus, sinceReview: sinceReview)
         let output = await run(agent: agent, executable: executable, searchPath: searchPath, directory: directory,
                                timeout: .seconds(420), writing: "Writing findings", activity: activity) { codexServers, copilotServers in
-            arguments(for: agent, prompt: prompt, addDirectories: repositories.dropFirst().map(\.root),
+            arguments(for: reviewer, prompt: prompt, addDirectories: repositories.dropFirst().map(\.root),
                       codexServers: codexServers, copilotServers: copilotServers)
         }
         switch output {
@@ -238,7 +353,7 @@ enum SecondOpinion {
                 SessionLog.note("\(agent.command) second opinion was unreadable: " + String(answer.prefix(400)))
                 return .failure(Failure(message: "Its answer was not a list of findings."))
             }
-            return .success(comments(from: findings, patches: patches, agent: agent))
+            return .success(comments(from: findings, patches: patches, agent: agent, model: reviewer.seatLabel))
         }
     }
 
@@ -404,8 +519,10 @@ enum SecondOpinion {
         return found.map { Array($0.prefix(maxFindings)) }
     }
 
-    // Every top-level bracketed run in the text, with brackets inside strings ignored.
-    static func jsonArrays(in text: String) -> [String] {
+    static func jsonArrays(in text: String) -> [String] { jsonRuns(in: text, open: "[", close: "]") }
+
+    // Every top-level run between the open and close marks, with marks inside strings ignored.
+    static func jsonRuns(in text: String, open: Character, close: Character) -> [String] {
         let characters = Array(text)
         var arrays: [String] = []
         var depth = 0
@@ -422,10 +539,10 @@ enum SecondOpinion {
             switch character {
             case "\"" where depth > 0:
                 inString = true
-            case "[":
+            case open:
                 if depth == 0 { start = index }
                 depth += 1
-            case "]" where depth > 0:
+            case close where depth > 0:
                 depth -= 1
                 if depth == 0, let begin = start {
                     arrays.append(String(characters[begin...index]))
@@ -440,7 +557,8 @@ enum SecondOpinion {
 
     // MARK: - Turning findings into comments
 
-    static func comments(from findings: [Finding], patches: [Patch], agent: AgentKind) -> [ReviewComment] {
+    static func comments(from findings: [Finding], patches: [Patch], agent: AgentKind,
+                         model: String? = nil) -> [ReviewComment] {
         findings.compactMap { finding in
             let body = finding.comment.trimmed
             guard !body.isEmpty, finding.line > 0,
@@ -450,11 +568,13 @@ enum SecondOpinion {
             let side: ReviewSide = patch.deleted ? .old : .new
             let lines = side == .new ? newLines(in: patch.text) : oldLines(in: patch.text)
             let excerpt = lines[finding.line] ?? fileLine(finding.line, of: patch) ?? ""
-            return ReviewComment(root: patch.root, path: patch.path,
-                                 anchor: DiffAnchor(side: side, line: finding.line),
-                                 excerpt: excerpt, body: body, author: .agent(agent),
-                                 status: .pending,
-                                 severity: finding.severity.flatMap { ReviewComment.Severity(rawValue: $0.lowercased()) })
+            var comment = ReviewComment(root: patch.root, path: patch.path,
+                                        anchor: DiffAnchor(side: side, line: finding.line),
+                                        excerpt: excerpt, body: body, author: .agent(agent),
+                                        status: .pending,
+                                        severity: finding.severity.flatMap { ReviewComment.Severity(rawValue: $0.lowercased()) })
+            comment.reviewerModel = model
+            return comment
         }
     }
 

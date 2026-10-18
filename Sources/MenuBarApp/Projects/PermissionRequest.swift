@@ -52,8 +52,17 @@ enum PermissionAnswer: Equatable, Sendable {
     // back with the answer, which is what makes it hold for the rest of this turn.
     case allowAddingDirectory(String)
     case deny
+    // Turn a plan down with what to change, so the agent keeps planning with that in mind.
+    case revise(String)
     // Question text to what the person picked or typed.
     case answers([String: String])
+
+    var allows: Bool {
+        switch self {
+        case .deny, .revise: false
+        case .allowOnce, .allowAlways, .allowAddingDirectory, .answers: true
+        }
+    }
 
     // For the log, which records that a question was answered but not what was said.
     var logLabel: String {
@@ -62,6 +71,7 @@ enum PermissionAnswer: Equatable, Sendable {
         case .allowAlways: "allow always"
         case .allowAddingDirectory(let directory): "allow and add \(directory)"
         case .deny: "deny"
+        case .revise: "revise"
         case .answers(let given): counted(given.count, "answer")
         }
     }
@@ -161,6 +171,8 @@ extension PermissionRequest {
         case .deny:
             decision = ["behavior": "deny",
                         "message": "The user did not allow this. Do not try it again without asking."]
+        case .revise(let feedback):
+            decision = ["behavior": "deny", "message": feedback]
         case .allowOnce, .allowAlways, .allowAddingDirectory, .answers:
             var updated = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any] ?? [:]
             if case .answers(let given) = answer { updated["answers"] = given }
