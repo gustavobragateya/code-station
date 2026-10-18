@@ -140,14 +140,14 @@ enum NavigatorList: Hashable {
     case files, review, questions
 }
 
-// Which comments the review list shows.
+// Which comments the review list shows. Findings still to look at are not in it: they
+// wait in the second opinion's own dialog until they are kept.
 enum ReviewFilter: Hashable {
-    case all, pending, yours, reviewers
+    case all, yours, reviewers
 
     func admits(_ comment: ReviewComment) -> Bool {
         switch self {
         case .all: true
-        case .pending: comment.isPending
         case .yours: comment.reviewer == nil
         case .reviewers: comment.reviewer != nil
         }
@@ -241,7 +241,9 @@ struct ChangesView: View {
 
     @State private var commentDraft: CommentDraft?
     @State private var toast: ReviewToast?
-    @State private var showsPicker = false
+    // The second opinion dialog showing progress or findings, so a reviewer finishing
+    // while it is open does not also raise a toast behind it.
+    @State private var secondOpinionDialog: UUID?
     @State private var pickerReviewers: Set<AgentKind> = []
     @State private var pickerScope = SecondOpinionScopeChoice.all
     // An unplaced comment waiting for a line number to be clicked to move onto.
@@ -391,32 +393,13 @@ struct ChangesView: View {
                     }
                 }
             }
-            .overlay {
-                // A click anywhere outside the picker puts it away, the way a menu goes.
-                // The picker floats over this area from the review bar below, which is
-                // drawn above it, so the click lands here only when it misses the card.
-                if showsPicker {
-                    Color.black.opacity(0.001)
-                        .onTapGesture { showsPicker = false }
-                }
-            }
             if let review, mode == .changes,
                !files.isEmpty || !review.reviews.comments(review.sessionID).isEmpty
                 || !review.reviews.rounds(review.sessionID).isEmpty {
-                // Each card sits in a ZStack that is always there. When an overlay's
+                // The toast sits in a ZStack that is always there. When an overlay's
                 // content is a bare `if`, SwiftUI drops the overlay's alignment and the
-                // alignment guide, and the card hangs down from the bar, off the screen.
+                // alignment guide, and the toast hangs down from the bar, off the screen.
                 reviewStrip(review)
-                    .overlay(alignment: .topTrailing) {
-                        ZStack {
-                            if showsPicker {
-                                secondOpinionPicker(review)
-                                    .transition(.opacity.combined(with: .offset(y: 6)))
-                            }
-                        }
-                        .padding(.trailing, 20)
-                        .alignmentGuide(.top) { $0[.bottom] + 8 }
-                    }
                     .overlay(alignment: .top) {
                         ZStack {
                             if let toast {
@@ -444,7 +427,6 @@ struct ChangesView: View {
         }
         .background(Theme.background)
         .background(WindowKeyAnchor(handler: reviewKeys))
-        .motion(Motion.reveal, value: showsPicker)
         .motion(Motion.reveal, value: toast?.id)
         .task(id: toast?.id) {
             guard let toast else { return }
@@ -743,8 +725,7 @@ struct ChangesView: View {
             if mode == .history { historyFilterField }
             if mode == .changes, let review {
                 let open = review.reviews.threads(review.sessionID).count { !$0.round.resolved.contains($0.comment.id) }
-                let count = review.reviews.comments(review.sessionID).count + open
-                let pending = !review.reviews.pending(review.sessionID).isEmpty
+                let count = review.reviews.kept(review.sessionID).count + open
                 let unread = review.reviews.unreadCount(review.sessionID) > 0
                 let asked = review.reviews.questions(review.sessionID)
                 let answering = asked.contains { $0.status == .answering }
@@ -753,7 +734,7 @@ struct ChangesView: View {
                         navigation.list = .files
                     }
                     ChoicePill(title: count > 0 ? "Review \(count)" : "Review", selected: showingReview,
-                               dot: pending ? Theme.attention : unread ? Theme.plan : nil) { showingReview = true }
+                               dot: unread ? Theme.plan : nil) { showingReview = true }
                     ChoicePill(title: asked.isEmpty ? "Questions" : "Questions \(asked.count)", selected: showingQuestions,
                                dot: answering ? Theme.plan : nil) { showingQuestions = true }
                     Spacer(minLength: 0)
@@ -2325,17 +2306,11 @@ struct ChangesView: View {
         announce(comment.spokenName)
     }
 
-    private func step(_ by: Int, onlyPending: Bool = false) {
-        let list = orderedComments.filter { !onlyPending || $0.isPending }
+    private func step(_ by: Int) {
+        let list = orderedComments
         guard let next = ReviewOrder.step(from: list.contains { $0.id == focusedComment } ? focusedComment : nil,
                                           by: by, in: list) else { return }
         focus(next)
-    }
-
-    private func nextPending() {
-        showingReview = true
-        if reviewFilter == .yours { reviewFilter = .all }
-        step(1, onlyPending: true)
     }
 
     // After a finding is sorted, focus moves on to the next one still waiting, so a whole
@@ -2377,7 +2352,7 @@ struct ChangesView: View {
     // The keys that move through a review and sort what is in it. Single letters only
     // count while a finding is in focus and nothing is being typed.
     private func handleReviewKey(_ event: NSEvent) -> Bool {
-        guard let review, mode == .changes, dialogs.current == nil, !showsPicker else { return false }
+        guard let review, mode == .changes, dialogs.current == nil else { return false }
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
         if flags == .option, event.keyCode == 125 || event.keyCode == 126 {
             step(event.keyCode == 125 ? 1 : -1)
@@ -2493,6 +2468,8 @@ struct ChangesView: View {
 
     // MARK: Review bar
 
+    // One line that says what you will send. Everything a second opinion is doing lives
+    // behind its one control, and the finer details are in the title's tooltip.
     @ViewBuilder private func reviewStrip(_ review: ReviewTarget) -> some View {
         let all = review.reviews.comments(review.sessionID)
         let kept = all.filter { !$0.isPending }
@@ -2503,51 +2480,22 @@ struct ChangesView: View {
         let sent = review.reviews.threads(review.sessionID).count
         let unread = review.reviews.unreadCount(review.sessionID)
         let asked = review.reviews.questions(review.sessionID).count
+        let details = [
+            !kept.isEmpty ? "On \(counted(fileCount, "file")). Changes wait here until you send them"
+                : all.isEmpty ? "Click a line number to ask or comment" : "Nothing kept yet",
+            sent > 0 ? "\(sent) sent" : nil,
+            unplaced > 0 ? "\(unplaced) not on a line, because its code moved or was removed" : nil,
+            settled > 0 ? "\(settled) on files with no changes left. They are still in the review, and the send dialog lists them" : nil
+        ].compactMap { $0 }
         HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Label("Your review", systemImage: "text.bubble.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .labelStyle(ReviewBarLabelStyle())
-                HStack(spacing: 8) {
-                    if unread > 0 {
-                        Button(action: nextUnread) {
-                            Text(unread == 1 ? "1 reply to read" : "\(unread) replies to read")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(Theme.plan)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .appTooltip("Open the next reply")
-                    }
-                    if sent > 0 { Text("\(sent) sent").lineLimit(1) }
-                    Text(!kept.isEmpty ? "On \(counted(fileCount, "file")). Changes wait here until you send them"
-                         : all.isEmpty ? "Click a line number to ask or comment" : "Nothing kept yet")
-                        .lineLimit(1)
-                    if pending > 0 {
-                        Button(action: nextPending) {
-                            Text("\(counted(pending, "finding")) to look at")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(Theme.attentionText)
-                                .padding(.horizontal, 7).padding(.vertical, 1)
-                                .background(Capsule().fill(Theme.attention.opacity(0.14)))
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .appTooltip("Look at the next finding  ⌥↓")
-                    }
-                    if unplaced > 0 {
-                        Text("\(unplaced) not on a line").appTooltip("Its code moved or was removed")
-                    }
-                    if settled > 0 {
-                        Text("\(settled) on files with no changes left").lineLimit(1)
-                            .appTooltip("Their file was committed or reverted. They are still in the review, and the send dialog lists them.")
-                    }
-                }
-                .font(.system(size: 11.5))
-                .foregroundStyle(.secondary)
-            }
-            .layoutPriority(1)
-            reviewCount(count: kept.count, text: kept.count == 1 ? "change to send" : "changes to send",
+            Label("Your review", systemImage: "text.bubble.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .labelStyle(ReviewBarLabelStyle())
+                .lineLimit(1)
+                .fixedSize()
+                .appTooltip(details.joined(separator: ". ") + ".")
+                .accessibilityHint(details.joined(separator: ". "))
+            reviewCount(count: kept.count, text: "to send",
                         icon: "pencil", tint: Theme.accent, help: "Goes to \(review.agent.title) when you send") {
                 showingReview = true
             }
@@ -2555,23 +2503,22 @@ struct ChangesView: View {
                         icon: "eye.slash", tint: Theme.plan, help: "Answered here. Never sent to \(review.agent.title)") {
                 showingQuestions = true
             }
+            if unread > 0 {
+                Button(action: nextUnread) {
+                    Text(unread == 1 ? "1 reply to read" : "\(unread) replies to read")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(Theme.plan)
+                        .lineLimit(1).fixedSize()
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .appTooltip("Open the next reply")
+            }
             Spacer(minLength: 8)
-            ForEach(review.reviews.runs(review.sessionID)) { run in
-                ReviewLane(run: run,
-                           stop: {
-                               review.reviews.stopSecondOpinion(review.sessionID, agent: run.agent)
-                               showToast("Stopped \(run.agent.title)'s review")
-                           },
-                           retry: { review.reviews.retrySecondOpinion(review.sessionID, agent: run.agent) },
-                           dismiss: { review.reviews.dismissLane(review.sessionID, agent: run.agent) })
-            }
-            ActionButton(title: "Second opinion", tone: .outlined, height: 28, size: 12,
-                         icon: "person.2", trailingIcon: showsPicker ? "chevron.down" : "chevron.up") {
-                openPicker(review)
-            }
-            .appTooltip("Ask other agents to review these changes")
-            .accessibilityLabel("Ask for a second opinion")
-            .accessibilityValue(showsPicker ? "Open" : "Closed")
+            SecondOpinionChip(status: secondOpinionStatus(review),
+                              open: { openSecondOpinion(review) },
+                              askAgain: { openAsk(review) })
+            Rectangle().fill(Theme.hairline).frame(width: 1, height: 20)
             if !all.isEmpty {
                 InlineLink(title: "Clear", tint: Color.secondary) { confirmClear(review, kept: kept.count, pending: pending) }
             }
@@ -2580,7 +2527,7 @@ struct ChangesView: View {
                 .opacity(kept.isEmpty ? 0.5 : 1)
                 .appTooltip("The exact message \(review.agent.title) gets")
             ActionButton(title: kept.isEmpty ? "Send to \(review.agent.title)"
-                         : "Send \(counted(kept.count, "comment")) to \(review.agent.title)",
+                         : "Send \(kept.count) to \(review.agent.title)",
                          tone: .green, height: 28, size: 12, icon: "paperplane.fill") { previewSend(review) }
                 .disabled(kept.isEmpty)
         }
@@ -2632,21 +2579,26 @@ struct ChangesView: View {
         return comments.count { !changed.contains($0.root + "/" + $0.path) }
     }
 
-    // Says once when each reviewer is done, with the way to its findings.
+    // Says once when each reviewer is done, with the way to its findings. The progress and
+    // findings dialogs already show it happen, so nothing is said while one is open.
     private func reportFinishedRuns(old: [SecondOpinionRun], new: [SecondOpinionRun]) {
+        guard let review else { return }
         for run in new where !run.isRunning {
             guard old.first(where: { $0.agent == run.agent })?.isRunning == true else { continue }
+            if secondOpinionDialog != nil, dialogs.current?.id == secondOpinionDialog {
+                announce("\(run.agent.title) finished its review")
+                continue
+            }
             switch run.state {
             case .finished(let found) where found > 0:
-                showToast("\(run.agent.title) left \(counted(found, "finding"))", action: "Look at them") {
-                    reviewFilter = .pending
-                    nextPending()
+                showToast("\(run.agent.title) found \(counted(found, "thing")) to look at", action: "Look at them") {
+                    openFindings(review, from: run.agent)
                 }
             case .finished:
                 showToast("\(run.agent.title) found nothing worth raising")
             case .failed:
                 showToast("\(run.agent.title) could not finish the review", action: "Try again") {
-                    review?.reviews.retrySecondOpinion(review?.sessionID ?? UUID(), agent: run.agent)
+                    review.reviews.retrySecondOpinion(review.sessionID, agent: run.agent)
                 }
             case .running:
                 break
@@ -2656,48 +2608,98 @@ struct ChangesView: View {
 
     // MARK: Second opinion
 
-    private func openPicker(_ review: ReviewTarget) {
-        if showsPicker {
-            showsPicker = false
-            return
+    private func secondOpinionStatus(_ review: ReviewTarget) -> SecondOpinionStatus {
+        SecondOpinionStatus(runs: review.reviews.runs(review.sessionID),
+                            findings: review.reviews.comments(review.sessionID).filter { $0.reviewer != nil },
+                            dismissed: review.reviews.dismissedFindings(review.sessionID).count)
+    }
+
+    // The bar's control opens whichever dialog its state is about.
+    private func openSecondOpinion(_ review: ReviewTarget) {
+        switch secondOpinionStatus(review) {
+        case .ask: openAsk(review)
+        case .reviewing, .failed: openProgress(review)
+        case .ready: openFindings(review)
+        case .settled(let kept, let dismissed):
+            if kept + dismissed > 0 { openFindings(review) } else { openProgress(review) }
         }
+    }
+
+    private func openAsk(_ review: ReviewTarget) {
         let installed = AgentKind.allCases.filter { review.executable($0) != nil }
+        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
         if pickerReviewers.isEmpty {
             // Another agent than the session's own is the useful default.
             pickerReviewers = Set(installed.filter { $0 != review.agent }.prefix(1))
         }
-        if pickerScope == .sinceReview, review.reviews.latestTrees(review.sessionID) == nil { pickerScope = .all }
+        let canReadSince = review.reviews.latestTrees(review.sessionID) != nil
+        if pickerScope == .sinceReview, !canReadSince { pickerScope = .all }
         if pickerScope == .file, selected == nil { pickerScope = .all }
-        showsPicker = true
-    }
-
-    private func secondOpinionPicker(_ review: ReviewTarget) -> some View {
-        let installed = AgentKind.allCases.filter { review.executable($0) != nil }
-        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
         let changed = repositories.reduce(0) { total, repository in
             total + ((repository.root == root ? snapshot : gitStats.snapshot(at: repository.root))?.files.count ?? 0)
         }
-        return SecondOpinionPicker(
-            sessionAgent: review.agent, installed: installed, running: running,
-            reviewers: $pickerReviewers,
-            focus: Binding(get: { navigation.secondOpinionFocus }, set: { navigation.secondOpinionFocus = $0 }),
-            scope: $pickerScope,
-            fileCount: changed, fileName: selected?.fileName,
-            canReadSince: review.reviews.latestTrees(review.sessionID) != nil,
-            ask: { askForSecondOpinion(review, running: running) },
-            cancel: { showsPicker = false })
+        secondOpinionDialog = nil
+        dialogs.show(Dialog(
+            title: "Ask for a second opinion",
+            content: AnyView(SecondOpinionAskView(
+                sessionAgent: review.agent, installed: installed, running: running,
+                reviewers: pickerReviewers, focus: navigation.secondOpinionFocus, scope: pickerScope,
+                fileCount: changed, fileName: selected?.fileName, canReadSince: canReadSince,
+                ask: { reviewers, focus, scope in
+                    pickerReviewers = reviewers
+                    navigation.secondOpinionFocus = focus
+                    pickerScope = scope
+                    askForSecondOpinion(review, agents: reviewers)
+                })),
+            actions: [], width: 620, framesItself: true))
     }
 
-    private func askForSecondOpinion(_ review: ReviewTarget, running: Set<AgentKind>) {
+    private func openProgress(_ review: ReviewTarget) {
+        let reviews = review.reviews
+        let sessionID = review.sessionID
+        let dialog = Dialog(
+            title: "Second opinion",
+            content: AnyView(SecondOpinionProgressView(
+                review: review,
+                stop: { agent in
+                    reviews.stopSecondOpinion(sessionID, agent: agent)
+                    announce("Stopped \(agent.title)'s review")
+                },
+                stopAll: {
+                    reviews.stopSecondOpinion(sessionID)
+                    announce("Stopped every review")
+                },
+                lookAt: { agent in openFindings(review, from: agent) })),
+            actions: [], width: 580, framesItself: true)
+        secondOpinionDialog = dialog.id
+        dialogs.show(dialog)
+    }
+
+    // Opens on the first finding still to look at, from one reviewer when asked.
+    private func openFindings(_ review: ReviewTarget, from agent: AgentKind? = nil) {
+        let list = SecondOpinionFindings.ordered(review.reviews.findings(review.sessionID))
+        let first = list.first { $0.isPending && (agent == nil || $0.reviewers.contains(agent!)) }
+            ?? list.first { agent == nil || $0.reviewers.contains(agent!) }
+        let dialog = Dialog(
+            title: "Findings",
+            content: AnyView(SecondOpinionFindingsView(review: review, selected: first?.id)),
+            actions: [], width: 900, framesItself: true)
+        secondOpinionDialog = dialog.id
+        dialogs.show(dialog)
+    }
+
+    private func askForSecondOpinion(_ review: ReviewTarget, agents: Set<AgentKind>) {
         let scope: SecondOpinionRequest.Scope
         switch pickerScope {
         case .all: scope = .all
         case .file: scope = selected.map { .file(root: repoRoot, path: $0.path) } ?? .all
         case .sinceReview: scope = review.reviews.latestTrees(review.sessionID).map { .sinceReview(trees: $0) } ?? .all
         }
-        let chosen = AgentKind.allCases.filter { pickerReviewers.contains($0) && !running.contains($0) }
+        let running = Set(review.reviews.runs(review.sessionID).filter(\.isRunning).map(\.agent))
+        let chosen = AgentKind.allCases.filter { agents.contains($0) && !running.contains($0) }
+        review.reviews.beginSecondOpinion(review.sessionID)
         startSecondOpinion(review, agents: chosen, scope: scope)
-        showsPicker = false
+        openProgress(review)
     }
 
     private func startSecondOpinion(_ review: ReviewTarget, agents: [AgentKind], scope: SecondOpinionRequest.Scope) {
@@ -2710,7 +2712,6 @@ struct ChangesView: View {
             asked.append(agent)
         }
         guard !asked.isEmpty else { return }
-        showingReview = true
         announce("Asked \(asked.map(\.title).joined(separator: " and ")) for a second opinion")
     }
 
@@ -2778,10 +2779,7 @@ struct ChangesView: View {
                 questionsLeftOut: leftOut, startsOnMessage: startsOnMessage,
                 fileName: fileLabel,
                 prompt: { ReviewPrompt.feedback($0, projectNames: names, note: $1) },
-                lookFirst: {
-                    reviewFilter = .pending
-                    nextPending()
-                },
+                lookFirst: { openFindings(review) },
                 send: { sendReview(review, comments: $0, note: $1) })),
             actions: [],
             width: 620))
@@ -3036,52 +3034,24 @@ struct ChangesView: View {
     // MARK: Review list
 
     @ViewBuilder private func reviewNavigator(_ review: ReviewTarget) -> some View {
-        let all = orderedComments
-        let pending = all.filter(\.isPending)
-        let runs = review.reviews.runs(review.sessionID)
-        let running = runs.filter(\.isRunning)
-        let emptyRun = runs.first { if case .finished(0) = $0.state { true } else { false } }
+        let all = orderedComments.filter { !$0.isPending }
         let list = all.filter(reviewFilter.admits)
         let threads = review.reviews.threads(review.sessionID)
         VStack(alignment: .leading, spacing: 8) {
             FlowRow(spacing: 4) {
                 filterPill("All", .all, count: all.count)
-                filterPill("To look at", .pending, count: pending.count)
                 filterPill("Yours", .yours, count: all.count { $0.reviewer == nil })
-                filterPill("Reviewers", .reviewers, count: all.count { $0.reviewer != nil })
+                filterPill("From reviewers", .reviewers, count: all.count { $0.reviewer != nil })
             }
             .padding(.horizontal, 12).padding(.top, 10)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
-                        if !running.isEmpty {
-                            summaryCard {
-                                HStack(spacing: 6) {
-                                    ProgressView().controlSize(.mini)
-                                    Text("\(running.map(\.agent.title).joined(separator: " and ")) \(running.count > 1 ? "are" : "is") reading the changes")
-                                        .font(.system(size: 12.5, weight: .semibold))
-                                }
-                                Text("Findings land here as each reviewer finishes. You can keep commenting while they work.")
-                                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        } else if let emptyRun {
-                            summaryCard {
-                                Label("\(emptyRun.agent.title) found nothing worth raising", systemImage: "checkmark")
-                                    .font(.system(size: 12.5, weight: .semibold))
-                                Text("Your own comments are below.")
-                                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                                ActionButton(title: "Ask another reviewer", tone: .outlined, height: 26, size: 11.5,
-                                             icon: "person.2") { openPicker(review) }
-                            }
-                        }
-                        if !pending.isEmpty { findingsSummary(pending, review: review) }
-                        if list.isEmpty && threads.isEmpty && running.isEmpty && emptyRun == nil {
+                        if list.isEmpty && threads.isEmpty {
                             VStack(spacing: 6) {
-                                if reviewFilter == .pending {
-                                    Image(systemName: "checkmark").foregroundStyle(Theme.dotOn)
-                                    Text("Nothing left to look at").font(.system(size: 12.5, weight: .semibold))
-                                    Text("Every finding has been kept or dismissed. Send the review when you are ready.")
+                                if reviewFilter == .reviewers {
+                                    Text("Nothing from reviewers yet").font(.system(size: 12.5, weight: .semibold))
+                                    Text("Ask for a second opinion from the review bar. What you keep shows up here.")
                                 } else {
                                     Text("No changes waiting").font(.system(size: 12.5, weight: .semibold))
                                     Text("Click a line number and choose Request a change, turn a question's suggestion into a change, or ask another agent for a second opinion.")
@@ -3172,76 +3142,6 @@ struct ChangesView: View {
 
     private func filterPill(_ title: String, _ filter: ReviewFilter, count: Int) -> some View {
         ChoicePill(title: "\(title) \(count)", selected: reviewFilter == filter) { reviewFilter = filter }
-    }
-
-    private func summaryCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8, content: content)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.field))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
-    }
-
-    private func findingsSummary(_ pending: [ReviewComment], review: ReviewTarget) -> some View {
-        let counts = ReviewComment.Severity.allCases.map { severity in
-            (severity, pending.count { $0.severity == severity })
-        }
-        let both = pending.count { !$0.also.isEmpty }
-        let who = Array(NSOrderedSet(array: pending.flatMap(\.reviewers).map(\.title))) as? [String] ?? []
-        return summaryCard {
-            Text("\(counted(pending.count, "finding")) from \(who.joined(separator: " and "))")
-                .font(.system(size: 12.5, weight: .semibold))
-            GeometryReader { geometry in
-                HStack(spacing: 2) {
-                    ForEach(counts.filter { $0.1 > 0 }, id: \.0) { severity, count in
-                        RoundedRectangle(cornerRadius: 2).fill(severityColour(severity))
-                            .frame(width: max(4, (geometry.size.width - 4) * CGFloat(count) / CGFloat(max(1, pending.count))))
-                    }
-                }
-            }
-            .frame(height: 5)
-            .accessibilityHidden(true)
-            FlowRow(spacing: 10) {
-                ForEach(counts.filter { $0.1 > 0 }, id: \.0) { severity, count in
-                    HStack(spacing: 4) {
-                        Circle().fill(severityColour(severity)).frame(width: 6, height: 6)
-                        Text("\(count) \(severity.label.lowercased())")
-                    }
-                }
-                if both > 0 { Label("\(both) raised by both", systemImage: "person.2") }
-            }
-            .font(.system(size: 11)).foregroundStyle(.secondary)
-            Text("Nothing goes to \(review.agent.title) until you keep it. Keep the ones you agree with, and dismiss the rest.")
-                .font(.system(size: 11.5)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 10) {
-                ActionButton(title: "Look at the first", tone: .green, height: 26, size: 11.5, action: nextPending)
-                    .appTooltip("Next finding  ⌥↓")
-                Spacer(minLength: 0)
-                InlineLink(title: "Keep all", size: 11.5, tint: Color.secondary) {
-                    review.reviews.keepAll(review.sessionID)
-                    focusedComment = nil
-                    showToast("Kept every finding. \(counted(review.reviews.kept(review.sessionID).count, "comment")) ready to send.")
-                }
-                InlineLink(title: "Dismiss all", size: 11.5, tint: Color.secondary) {
-                    let gone = review.reviews.dismissAllPending(review.sessionID)
-                    focusedComment = nil
-                    let reviews = review.reviews
-                    let sessionID = review.sessionID
-                    showToast("Dismissed \(counted(gone.count, "finding"))", action: "Undo") {
-                        for comment in gone { reviews.restore(comment, to: sessionID) }
-                    }
-                }
-            }
-        }
-    }
-
-    private func severityColour(_ severity: ReviewComment.Severity) -> Color {
-        switch severity {
-        case .must: Theme.deletion
-        case .should: Theme.attention
-        case .look: Color.secondary.opacity(0.5)
-        }
     }
 
     private func reviewItem(_ comment: ReviewComment) -> some View {

@@ -538,7 +538,7 @@ struct SecondOpinionRequest: Equatable, Sendable {
     var executable: String
 }
 
-// One reviewer's lane in the review bar: what it is reading, how long it has taken,
+// One reviewer's lane in the second opinion: what it is reading, how long it has taken,
 // and what it came to.
 struct SecondOpinionRun: Equatable, Identifiable {
     enum State: Equatable {
@@ -552,6 +552,8 @@ struct SecondOpinionRun: Equatable, Identifiable {
     var ended: Date?
     var state: State = .running
     var activity = "Gathering the changes"
+    // The last few things it did, oldest first, ending with the activity.
+    var recent = ["Gathering the changes"]
     var request: SecondOpinionRequest
 
     var id: AgentKind { agent }
@@ -697,6 +699,9 @@ final class ReviewCommentStore {
     // Second opinions, one lane per reviewer. They outlive the Changes tab, which can be
     // closed and reopened while one runs.
     private(set) var runs: [UUID: [SecondOpinionRun]] = [:]
+    // Findings dismissed since the last second opinion was asked for, so they can still be
+    // shown as dismissed and brought back. Kept only while the app runs.
+    private var dismissedFindings: [UUID: [ReviewComment]] = [:]
     private var rounds: [UUID: [ReviewRound]] = [:]
     // Questions answered on the Changes screen, which never go to the agent.
     private var questions: [UUID: [ReviewQuestion]] = [:]
@@ -826,6 +831,7 @@ final class ReviewCommentStore {
 
     func clear(_ sessionID: UUID) {
         comments[sessionID] = nil
+        dismissedFindings[sessionID] = nil
         saver?.schedule()
     }
 
@@ -850,6 +856,14 @@ final class ReviewCommentStore {
         saver?.schedule()
     }
 
+    // Puts a kept finding back among those still to look at.
+    func reopen(_ id: UUID, in sessionID: UUID) {
+        guard let index = comments[sessionID]?.firstIndex(where: { $0.id == id }),
+              comments[sessionID]?[index].reviewer != nil else { return }
+        comments[sessionID]?[index].status = .pending
+        saver?.schedule()
+    }
+
     func keepAll(_ sessionID: UUID) {
         guard let all = comments[sessionID] else { return }
         comments[sessionID] = all.map { var comment = $0; comment.status = .kept; return comment }
@@ -862,6 +876,7 @@ final class ReviewCommentStore {
         guard let index = comments[sessionID]?.firstIndex(where: { $0.id == id }),
               let comment = comments[sessionID]?.remove(at: index) else { return nil }
         if comments[sessionID]?.isEmpty == true { comments[sessionID] = nil }
+        if comment.isPending { dismissedFindings[sessionID, default: []].append(comment) }
         saver?.schedule()
         return (comment, index)
     }
@@ -869,6 +884,7 @@ final class ReviewCommentStore {
     @discardableResult
     func dismissAllPending(_ sessionID: UUID) -> [ReviewComment] {
         let gone = pending(sessionID)
+        dismissedFindings[sessionID, default: []].append(contentsOf: gone)
         comments[sessionID]?.removeAll(where: \.isPending)
         if comments[sessionID]?.isEmpty == true { comments[sessionID] = nil }
         saver?.schedule()
@@ -877,6 +893,7 @@ final class ReviewCommentStore {
 
     func restore(_ comment: ReviewComment, at index: Int? = nil, to sessionID: UUID) {
         guard self.comment(comment.id, in: sessionID) == nil else { return }
+        dismissedFindings[sessionID]?.removeAll { $0.id == comment.id }
         var list = comments[sessionID] ?? []
         list.insert(comment, at: min(index ?? list.count, list.count))
         comments[sessionID] = list
@@ -918,6 +935,22 @@ final class ReviewCommentStore {
     // MARK: - Second opinion
 
     func runs(_ sessionID: UUID) -> [SecondOpinionRun] { runs[sessionID] ?? [] }
+
+    func dismissedFindings(_ sessionID: UUID) -> [ReviewComment] { dismissedFindings[sessionID] ?? [] }
+
+    // Every finding from a reviewer the person has yet to send: those still to look at,
+    // those kept, and those dismissed since the last ask.
+    func findings(_ sessionID: UUID) -> [ReviewComment] {
+        comments(sessionID).filter { $0.reviewer != nil } + dismissedFindings(sessionID)
+    }
+
+    // A new ask starts clean: lanes that already finished and findings already dismissed
+    // belong to the one before. Nothing happens while a reviewer is still at work.
+    func beginSecondOpinion(_ sessionID: UUID) {
+        guard !isReviewing(sessionID) else { return }
+        runs[sessionID] = nil
+        dismissedFindings[sessionID] = nil
+    }
 
     func isReviewing(_ sessionID: UUID) -> Bool { runs(sessionID).contains(where: \.isRunning) }
 
@@ -987,8 +1020,11 @@ final class ReviewCommentStore {
     }
 
     private func setActivity(_ text: String, agent: AgentKind, in sessionID: UUID) {
-        guard let index = runs[sessionID]?.firstIndex(where: { $0.agent == agent && $0.isRunning }) else { return }
-        runs[sessionID]?[index].activity = text
+        guard let index = runs[sessionID]?.firstIndex(where: { $0.agent == agent && $0.isRunning }),
+              var run = runs[sessionID]?[index], run.activity != text else { return }
+        run.activity = text
+        run.recent = Array((run.recent + [text]).suffix(3))
+        runs[sessionID]?[index] = run
     }
 
     // Called by the run when it ends; tests call it directly with what a reviewer said.
