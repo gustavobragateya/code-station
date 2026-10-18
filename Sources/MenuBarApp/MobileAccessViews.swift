@@ -95,6 +95,9 @@ struct MobileAccessButton: View {
     // the app.
     var onRail = false
     var showsWord = true
+    // Home has the room to say what the button is for even before anything is shared, and
+    // it is where someone looks for a way to take the app with them.
+    var named = false
 
     @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(DialogPresenter.self) private var dialogs
@@ -105,9 +108,10 @@ struct MobileAccessButton: View {
         let connected = mobileAccess.isLive(scope)
         let label = tooltip(shared: share != nil, connected: connected)
         return Group {
-            if onRail {
+            if onRail || named {
                 PhoneCapsule(link: .of(shared: share != nil, connected: connected),
                              showsWord: showsWord,
+                             named: named,
                              label: label,
                              action: open)
             } else {
@@ -142,16 +146,30 @@ struct MobileAccessButton: View {
 
 // The phone button on the session rail. With nothing shared it is a bare QR glyph; once a
 // code is out it fills amber and says it is waiting, and once a phone joins it turns green
-// with a slow ring around its light.
+// with a slow ring around its light. A named one is a bordered pill that says "Open on
+// phone" while nothing is shared, and lets a peek card explain what that means.
 private struct PhoneCapsule: View {
     let link: PhoneLink
     let showsWord: Bool
+    var named = false
     let label: String
     let action: () -> Void
 
     @State private var hovering = false
+    @State private var anchor = FrameAnchor()
+    @FocusState private var focused: Bool
+
+    static let offer = "Open on phone"
 
     var body: some View {
+        if named {
+            namedPill
+        } else {
+            capsule
+        }
+    }
+
+    private var capsule: some View {
         Button(action: action) {
             HStack(spacing: 7) {
                 switch link {
@@ -191,6 +209,121 @@ private struct PhoneCapsule: View {
         }
         .accessibilityLabel("Phone")
         .accessibilityValue(link.word ?? "Not shared")
+    }
+
+    private var namedPill: some View {
+        let offering = link == .none
+        return Button(action: action) {
+            HStack(spacing: 8) {
+                lead
+                Text(link.word ?? Self.offer)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .foregroundStyle(offering ? Theme.accent : link.tint)
+            .padding(.leading, offering ? 11 : 12)
+            .padding(.trailing, 14)
+            .frame(height: 32)
+            .background(Capsule().fill(link.fill ?? Theme.card))
+            .overlay {
+                if offering {
+                    Capsule().stroke(lit ? Theme.accent.opacity(0.4) : Theme.settingsBorder)
+                }
+            }
+            .shadow(color: Theme.accent.opacity(offering && lit ? 0.1 : 0), radius: 5, y: 3)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressablePill())
+        .focused($focused)
+        .onHover { hovering = $0 }
+        .motion(Motion.hover, value: lit)
+        .motion(HeaderMotion.slide, value: link)
+        .appTooltip(delay: .zero, isFocused: focused && offering) {
+            if offering {
+                Tooltip(title: "", hanging: Tooltip.Hanging(
+                    width: PhonePeek.width,
+                    edges: peekEdges,
+                    content: AnyView(PhonePeek())))
+            } else {
+                Tooltip(title: label, subtitle: "Show the code or stop sharing")
+            }
+        }
+        .background(FrameAnchorView(anchor: anchor))
+        .accessibilityLabel(label)
+        .accessibilityValue(link.word ?? "Not shared")
+    }
+
+    private var lit: Bool { hovering || focused }
+
+    @ViewBuilder
+    private var lead: some View {
+        switch link {
+        case .none:
+            Image(systemName: "qrcode")
+                .font(.system(size: 12.5, weight: .semibold))
+        case .waiting:
+            Circle()
+                .fill(Theme.attention)
+                .frame(width: 6, height: 6)
+        case .connected:
+            PulsingDot(colour: Theme.addition, size: 6)
+        }
+    }
+
+    // The pill sits at the right edge of the header, so its card lines up with the pill's
+    // right side rather than hanging past the window.
+    private var peekEdges: ClosedRange<CGFloat> {
+        guard let frame = anchor.frame() else { return 0...PhonePeek.width }
+        return (frame.maxX - PhonePeek.width)...frame.maxX
+    }
+}
+
+// Pressing the pill gives a little under the pointer. The scale is on the label, never on
+// the button, since the button carries AppKit-backed hover and tooltip views.
+private struct PressablePill: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .motion(Motion.hover, value: configuration.isPressed)
+    }
+}
+
+// What the Home phone pill offers, shown before anything is shared. The code is only a
+// picture of one, blurred, since no code exists until sharing starts.
+private struct PhonePeek: View {
+    static let width: CGFloat = 280
+    static let title = "Take Code Station with you"
+    static let message = "Scan a code to watch your sessions and answer them from your phone. Works on the same Wi-Fi."
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Group {
+                if let url = URL(string: "https://code-station.invalid/m"),
+                   let image = MobilePairingQRCode.image(for: url) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .blur(radius: 2.5)
+                        .opacity(0.55)
+                }
+            }
+            .frame(width: 60, height: 60)
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.white))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(Self.title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(Self.message)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
     }
 }
 
