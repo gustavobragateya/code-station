@@ -345,6 +345,9 @@ struct SecondOpinionAskView: View {
                     HStack(spacing: 8) {
                         ForEach(order, id: \.self) { agent in reviewerCard(agent) }
                     }
+                    // Each card fills the row's height so they all match, so the row has to
+                    // keep to the tallest card or the cards stretch to fill the dialog.
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     FieldLabel(title: "What to look for")
