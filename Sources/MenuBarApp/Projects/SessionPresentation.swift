@@ -35,9 +35,19 @@ extension SessionRunner {
     // clear away have to ask this rather than the session's own state.
     @MainActor
     func isBusy(_ sessionID: UUID, store: ProjectStore) -> Bool {
-        if state(sessionID).isBusy { return true }
+        if state(sessionID).isBusy || isAskingSecondOpinion(sessionID) { return true }
         guard let companion = store.designCompanions[sessionID] else { return false }
         return state(companion.id).isBusy
+    }
+
+    // A second opinion runs beside the agent rather than as one of its turns, so the
+    // session's own state stays idle while a reviewer works. Rows still have to show it
+    // as running, or a review that takes minutes looks like nothing is happening.
+    @MainActor
+    func isAskingSecondOpinion(_ sessionID: UUID) -> Bool {
+        reviews.isReviewing(sessionID)
+            || opinions.opinions(sessionID).contains(where: \.isRunning)
+            || designOpinions.opinion(sessionID)?.isRunning == true
     }
 }
 
@@ -89,7 +99,7 @@ extension SessionTone {
     @MainActor
     init(_ sessionID: UUID, store: ProjectStore, runner: SessionRunner) {
         let live = LiveConversation.id(of: sessionID, store: store, runner: runner)
-        self.init(busy: runner.state(live).isBusy,
+        self.init(busy: runner.state(live).isBusy || runner.isAskingSecondOpinion(sessionID),
                   needsInput: runner.question(live) != nil,
                   finished: store.isUnread(sessionID),
                   waiting: runner.state(live) == .waiting,

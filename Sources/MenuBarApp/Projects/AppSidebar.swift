@@ -587,16 +587,17 @@ struct AppSidebar: View {
             let live = LiveConversation.of(session.id, store: store, runner: runner)
                 ?? session
             let state = runner.state(live.id)
+            let busy = state.isBusy || runner.isAskingSecondOpinion(session.id)
             SidebarRailRow(colour: tint.colour, selectedColour: Theme.accent,
                            selected: selected, pinned: session.isPinned,
-                           thread: ThreadPhase(busy: state.isBusy,
+                           thread: ThreadPhase(busy: busy,
                                                failed: state.isFailed,
                                                finished: store.isUnread(session.id)),
                            threadEndedCleanly: runner.lastTurnEnding(live.id)?.outcome == .finished) {
                 SessionCard(session: session,
                             worktrees: store.worktreeCoverage(for: session),
                             selected: selected,
-                            busy: state.isBusy,
+                            busy: busy,
                             failed: state.isFailed,
                             waiting: state == .waiting,
                             waitIsStale: runner.waitIsStale(live.id),
@@ -672,7 +673,7 @@ struct AppSidebar: View {
         sessions.count { session in
             let live = LiveConversation.of(session.id, store: store, runner: runner) ?? session
             let state = runner.state(live.id)
-            return SessionTone(busy: state.isBusy,
+            return SessionTone(busy: state.isBusy || runner.isAskingSecondOpinion(session.id),
                                needsInput: runner.question(live.id) != nil,
                                finished: store.isUnread(session.id),
                                waiting: state == .waiting,

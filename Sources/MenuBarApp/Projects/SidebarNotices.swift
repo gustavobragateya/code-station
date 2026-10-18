@@ -22,7 +22,7 @@ enum SidebarNotices {
             let live = LiveConversation.id(of: session.id, store: store, runner: runner)
             let question = runner.question(live)
             guard let notice = SessionNotice(
-                isBusy: runner.state(live).isBusy,
+                isBusy: runner.state(live).isBusy || runner.isAskingSecondOpinion(session.id),
                 needsInput: question != nil,
                 finishedUnseen: store.hasFinished(session.id)) else { return nil }
             return NoticedSession(session: session, project: project, notice: notice,
