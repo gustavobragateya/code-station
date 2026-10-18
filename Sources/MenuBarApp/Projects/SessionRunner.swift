@@ -1513,6 +1513,14 @@ final class SessionRunner {
         if let git = GitInspector.tool() {
             TreeSnapshots.shared.baseline(at: workingDirectory, using: git)
         }
+        // Read before the agent starts, which is long before it could make a commit.
+        let startHeads = Task {
+            var heads: [String: String] = [:]
+            for directory in workingDirectories {
+                heads[directory] = await GitInspector.head(at: directory)
+            }
+            return heads
+        }
 
         // Summaries belong to the session title or recap card, so their replies stay
         // private to the turn.
@@ -1559,6 +1567,10 @@ final class SessionRunner {
 
         turn.isFirstTurn = isFirstTurn
         recordAddingIfMissing(sessionID).turn = turn
+        Task { [weak turn] in
+            let heads = await startHeads.value
+            turn?.startHeads = heads
+        }
         if let presetSessionID = plan.presetSessionID {
             turn.agentSessionID = presetSessionID
             store.setAgentSessionID(presetSessionID, agent: agent, for: sessionID)
@@ -2722,7 +2734,7 @@ final class SessionRunner {
             let unseen: Bool
             records[sessionID]?.lastEnding = TurnEnding(
                 started: turn.startedAt, ended: Date(),
-                outcome: turn.stopFailure == nil ? .stopped : .failed)
+                outcome: turn.stopFailure == nil ? .stopped : .failed, startHeads: turn.startHeads)
             if let failure = turn.stopFailure {
                 setState(.failed(failure), for: sessionID)
                 unseen = store.noteTurnEnded(for: sessionID)
@@ -2744,7 +2756,7 @@ final class SessionRunner {
         guard turn.failure != nil || status != 0 || missingCompletion else {
             SessionLog.note("turn finished", session: sessionID)
             records[sessionID]?.lastEnding = TurnEnding(started: turn.startedAt, ended: Date(),
-                                                        outcome: .finished)
+                                                        outcome: .finished, startHeads: turn.startHeads)
             setState(.idle, for: sessionID)
             let titleQueued = queueAutomaticTitle(after: turn, sessionID: sessionID,
                                                   store: store)
@@ -2812,7 +2824,7 @@ final class SessionRunner {
             records[sessionID]?.continuable = .failedTurn
         }
         records[sessionID]?.lastEnding = TurnEnding(started: turn.startedAt, ended: Date(),
-                                                    outcome: .failed)
+                                                    outcome: .failed, startHeads: turn.startHeads)
         setState(.failed(message), for: sessionID)
         store.release(sessionID, for: .running)
         resumeDesignWorkflowQueues(after: sessionID, store: store)
@@ -2997,6 +3009,7 @@ final class SessionRunner {
         // Fixed at the moment the turn began, which is what the status strip counts from
         // while it runs. `lastActivity` cannot answer that: it moves all turn.
         let startedAt = Date()
+        var startHeads: [String: String] = [:]
 
         // One line down the pipe the CLI is reading. False when it could not be sent: the
         // process is gone, or its end of the pipe is shut.

@@ -128,7 +128,7 @@ struct TurnSeal: View {
                 .overlay(RoundedRectangle(cornerRadius: 7.5)
                     .stroke(reviewFocused ? Theme.accent : .clear, lineWidth: 2).padding(-3))
                 .onKeyPress(keys: [.space, .return]) { _ in review(); return .handled }
-                .accessibilityHint("Opens current repository changes, including edits made before this turn")
+                .accessibilityHint("Opens the uncommitted changes, including edits made before this turn, or the commits this turn made when nothing is left uncommitted")
         }
     }
 }

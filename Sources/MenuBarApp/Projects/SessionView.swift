@@ -1775,8 +1775,7 @@ struct SessionView: View {
                          review: runner.question(sessionID) == nil ? {
                              reviewingEnding = ending.ended
                              focusHandoffReview = false
-                             changesNavigation.showingHistory = false
-                             openChanges()
+                             Task { await openTurnChanges(ending, in: session) }
                          } : nil)
                     .id(ending.ended)
                     .transition(.identity)
@@ -1983,6 +1982,26 @@ struct SessionView: View {
     private func openChanges() {
         requestedChange = nil
         tab = .changes
+    }
+
+    // A turn that committed its work leaves nothing in the working tree, so its review is
+    // the range of commits it made instead. Uncommitted work anywhere keeps the review on
+    // the working tree, where it can be commented on and committed.
+    private func openTurnChanges(_ ending: TurnEnding, in session: ChatSession) async {
+        let committed = await GitInspector.turnCommits(roots: store.workingDirectories(for: session),
+                                                       startHeads: ending.startHeads)
+        guard reviewingEnding == ending.ended else { return }
+        guard let committed else {
+            changesNavigation.showingHistory = false
+            openChanges()
+            return
+        }
+        let history = changesNavigation.history(for: committed.root)
+        history.select(committed.head)
+        history.parent = committed.start
+        changesNavigation.showingHistory = true
+        selectWorkspaceRoot(committed.root, in: session)
+        openChanges()
     }
 
     private func openChange(_ path: String, root: String) {

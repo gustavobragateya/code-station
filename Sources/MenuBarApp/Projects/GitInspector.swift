@@ -411,6 +411,40 @@ enum GitInspector {
         await uncommittedFileCount(at: path) > 0
     }
 
+    // The full hash of the commit checked out at a path. Nil outside a repository and in
+    // one with no commits yet.
+    static func head(at path: String) async -> String? {
+        guard let tool = await tool() else { return nil }
+        return await offMain(lane: .interactive) {
+            let output = run(tool, ["rev-parse", "--verify", "--quiet", "HEAD"],
+                             in: URL(fileURLWithPath: path))
+            let hash = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return output.ok && !hash.isEmpty ? hash : nil
+        }
+    }
+
+    struct TurnCommits {
+        let root: String
+        let start: String
+        let head: GitCommitSummary
+    }
+
+    // The commits a turn made, when it committed all of its work. Nil when any folder
+    // still holds uncommitted work, since that work is what needs reviewing, and nil when
+    // no folder moved to a new commit. With several folders the first one that moved wins.
+    static func turnCommits(roots: [String], startHeads: [String: String]) async -> TurnCommits? {
+        var found: TurnCommits?
+        for root in roots {
+            if await isDirty(at: root) { return nil }
+            guard found == nil, let start = startHeads[root],
+                  let head = await head(at: root), head != start,
+                  let summary = await recentCommits(at: root, limit: 1).commits.first
+            else { continue }
+            found = TurnCommits(root: root, start: start, head: summary)
+        }
+        return found
+    }
+
     // MARK: - History
 
     // Listing subjects is cheap even on a big repository; the expensive part of history
