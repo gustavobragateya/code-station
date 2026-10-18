@@ -67,10 +67,6 @@ struct SessionWorkingSet: View {
     private var header: some View {
         HStack(spacing: 8) {
             StateLight(tone: tone)
-            Text("WORKING SET")
-                .font(.mono(9.5, .semibold))
-                .kerning(1)
-                .foregroundStyle(.secondary)
             Spacer(minLength: 8)
             Button(action: close) {
                 Image(systemName: "xmark")
