@@ -1293,10 +1293,7 @@ extension View {
     func sidebarFocusRing(_ focused: FocusState<Bool>.Binding) -> some View {
         self.focused(focused)
             .focusEffectDisabled()
-            .overlay(RoundedRectangle(cornerRadius: 6)
-                .stroke(focused.wrappedValue ? Theme.accent : .clear, lineWidth: 2)
-                .padding(-2)
-                .allowsHitTesting(false))
+            .overlay(FocusRingStroke(focused: focused.wrappedValue))
     }
 }
 

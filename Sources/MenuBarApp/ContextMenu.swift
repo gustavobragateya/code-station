@@ -274,10 +274,7 @@ private struct AppMenuButton: ViewModifier {
         .focusEffectDisabled(showsFocusRing)
         .overlay {
             if showsFocusRing {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(triggerFocused ? Theme.accent : .clear, lineWidth: 2)
-                    .padding(-2)
-                    .allowsHitTesting(false)
+                FocusRingStroke(focused: triggerFocused)
             }
         }
         .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
