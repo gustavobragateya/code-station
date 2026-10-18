@@ -109,6 +109,10 @@ final class SessionRunner {
     let composer = SessionComposerStore()
     // Comments left on each session's changes, waiting to be sent back to its agent.
     let reviews: ReviewCommentStore
+    // Second opinions on plans and answers in Chat, waiting for the person to send them.
+    let opinions = ChatOpinionStore()
+    // Second opinions on each Design session's screens, with the notes they pinned.
+    let designOpinions = DesignOpinionStore()
 
     // How wide the canvas is showing the design, in CSS pixels. The agent writes HTML it
     // never sees rendered, so without this it designs for a window it imagined and the
@@ -286,6 +290,17 @@ final class SessionRunner {
         }
     }
 
+    // The seat a session's own agent works in, which a second opinion's independence is
+    // measured against. Read the way a launch reads it, falling back to the model the
+    // agent last reported running on.
+    func author(of session: ChatSession) -> SecondOpinion.Reviewer {
+        let model = validModel(session.settings?.model, for: session.agent)
+            ?? session.usage?.model(for: session.agent)
+        let effort = validEffort(session.settings?.effort ?? defaults(for: session.agent).effort,
+                                 for: session.agent, model: model)
+        return SecondOpinion.Reviewer(agent: session.agent, model: model, effort: effort)
+    }
+
     func modelOptions(for agent: AgentKind) -> [ModelChoice.Option] {
         ModelChoice.options(for: agent, discovered: discoveredModels[agent])
     }
@@ -445,7 +460,7 @@ final class SessionRunner {
         // and in the session's settings, which every later turn is started from.
         var settingsAfterPlan: SessionSettings?
         var leavingPlanFor: PermissionMode?
-        if request.toolName == "ExitPlanMode", answer != .deny,
+        if request.toolName == "ExitPlanMode", answer.allows,
            let session = store.session(sessionID) {
             var settings = session.settings ?? SessionSettings()
             if settings.permissionMode == PermissionMode.plan.rawValue {
@@ -478,6 +493,12 @@ final class SessionRunner {
         if case .answers(let given) = answer, !given.isEmpty,
            let carriesOn = store.recordAnswer(PermissionRequest.transcript(of: given),
                                               in: sessionID, continuing: turn.messageID) {
+            turn.messageID = carriesOn
+        }
+        // What a plan was sent back with travels as the refusal's reason, which the
+        // conversation would otherwise never show.
+        if case .revise(let feedback) = answer,
+           let carriesOn = store.recordAnswer(feedback, in: sessionID, continuing: turn.messageID) {
             turn.messageID = carriesOn
         }
     }
@@ -1416,6 +1437,8 @@ final class SessionRunner {
         records[sessionID] = nil
         composer.remove(sessionID)
         reviews.remove(sessionID)
+        opinions.remove(sessionID)
+        designOpinions.dismiss(sessionID)
         canvasWidths[sessionID] = nil
     }
 

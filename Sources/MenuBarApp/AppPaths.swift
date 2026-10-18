@@ -247,6 +247,17 @@ enum Preferences {
 
     // What a session runs with when it has not picked for itself. Defaults belong to the
     // agent that reads them, so one CLI's model and access choices cannot affect another.
+    // The second opinion lineup the person saved as their usual. Empty until they save one.
+    static func secondOpinionLineup(in store: UserDefaults = .standard) -> [SecondOpinion.Reviewer] {
+        guard let data = store.data(forKey: "secondOpinionLineup"),
+              let lineup = try? JSONDecoder().decode([SecondOpinion.Reviewer].self, from: data) else { return [] }
+        return lineup
+    }
+
+    static func setSecondOpinionLineup(_ lineup: [SecondOpinion.Reviewer], in store: UserDefaults = .standard) {
+        store.set(try? JSONEncoder().encode(lineup), forKey: "secondOpinionLineup")
+    }
+
     static func sessionDefaults(for agent: AgentKind) -> SessionSettings {
         switch agent {
         case .claudeCode:

@@ -13,6 +13,8 @@ struct PermissionCard: View {
     var workingDirectories: [String] = []
     // Where a subject written as markdown resolves the files it links to.
     var projectPath: String = ""
+    // Opens the second opinion picker on a plan. Nil where there is no plan to judge.
+    var secondOpinion: (() -> Void)? = nil
     let onAnswer: (PermissionAnswer) -> Void
 
     var body: some View {
@@ -109,6 +111,11 @@ struct PermissionCard: View {
                     CardButton(title: always) { onAnswer(.allowAlways) }
                 }
                 Spacer(minLength: 0)
+                if request.subjectIsMarkdown, let secondOpinion {
+                    SecondOpinionButton(open: false, usual: Preferences.secondOpinionLineup().map(\.agent),
+                                        action: secondOpinion)
+                        .appTooltip("Ask other agents to check this plan before anything changes")
+                }
                 CardButton(title: "Deny") { onAnswer(.deny) }
             }
         }

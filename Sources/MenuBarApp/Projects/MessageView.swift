@@ -19,6 +19,9 @@ struct MessageView: View, Equatable {
     // Whether this is the prompt the composer has just sent, which lifts into place.
     var arriving = false
     var bubble = UserMessageStyle.leaf
+    // Opens the second opinion picker on this answer, from its hover actions. Nil where
+    // the answer is not one to judge, such as one still being written.
+    var secondOpinion: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -31,6 +34,7 @@ struct MessageView: View, Equatable {
         a.message == b.message && a.projectPath == b.projectPath
             && a.textScale == b.textScale && a.availableWidth == b.availableWidth
             && a.arriving == b.arriving && a.bubble == b.bubble
+            && (a.secondOpinion == nil) == (b.secondOpinion == nil)
     }
 
     var body: some View {
@@ -176,7 +180,7 @@ struct MessageView: View, Equatable {
                     }
                     .padding(.trailing, 32)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .transcriptCopyButton(for: text.trimmed)
+                    .transcriptCopyButton(for: text.trimmed, secondOpinion: secondOpinion)
                 case .thinking(_, let text):
                     ThinkingBlock(text: text)
                         .transition(.fadeIn)
@@ -294,6 +298,26 @@ private struct ThinkingBlock: View {
 // The transcript's copy affordance, shared by whole messages and by single code blocks:
 // the copy button on a small card lifted off the page, since it floats over text rather
 // than sitting in a row of its own.
+// Beside the copy pill on an answer: ask other agents what they make of it.
+private struct SecondOpinionPill: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "person.2")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+                .cardSurface(cornerRadius: 6)
+                .shadow(color: .black.opacity(0.08), radius: 2, y: 1)
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .appTooltip("Get a second opinion on this answer")
+        .accessibilityLabel("Get a second opinion on this answer")
+    }
+}
+
 private struct CopyPill: View {
     let text: String
     let tooltip: String
@@ -326,6 +350,7 @@ private struct TranscriptCopyButton: ViewModifier {
     let text: String
     let tooltip: String
     let inset: CGFloat
+    var secondOpinion: (() -> Void)?
 
     func body(content: Content) -> some View {
         content
@@ -337,15 +362,21 @@ private struct TranscriptCopyButton: ViewModifier {
             .onPreferenceChange(DescendantCopyHoverKey.self) { descendantHovering = $0 }
             .overlay(alignment: .topTrailing) {
                 if hovering && !descendantHovering && !text.isEmpty {
-                    CopyPill(text: text, tooltip: tooltip)
-                        .padding(inset)
-                        .transition(.fadeIn)
+                    HStack(spacing: 4) {
+                        if let secondOpinion { SecondOpinionPill(action: secondOpinion) }
+                        CopyPill(text: text, tooltip: tooltip)
+                    }
+                    .padding(inset)
+                    .transition(.fadeIn)
                 }
             }
             .onHover { hovering = $0 }
             .motion(Motion.hover, value: hovering)
             .motion(Motion.hover, value: descendantHovering)
             .accessibilityAction(named: tooltip) { Pasteboard.copy(text) }
+            .accessibilityActions {
+                if let secondOpinion { Button("Get a second opinion", action: secondOpinion) }
+            }
             .transformPreference(DescendantCopyHoverKey.self) { $0 = $0 || hovering }
     }
 }
@@ -353,8 +384,9 @@ private struct TranscriptCopyButton: ViewModifier {
 extension View {
     func transcriptCopyButton(for text: String,
                               tooltip: String = "Copy text",
-                              inset: CGFloat = 4) -> some View {
-        modifier(TranscriptCopyButton(text: text, tooltip: tooltip, inset: inset))
+                              inset: CGFloat = 4,
+                              secondOpinion: (() -> Void)? = nil) -> some View {
+        modifier(TranscriptCopyButton(text: text, tooltip: tooltip, inset: inset, secondOpinion: secondOpinion))
     }
 }
 

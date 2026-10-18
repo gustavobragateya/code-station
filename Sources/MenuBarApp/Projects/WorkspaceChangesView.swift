@@ -52,7 +52,9 @@ struct WorkspaceChangesView: View {
 
     private var review: ReviewTarget {
         let sessionID = session.id
+        let author = runner.author(of: session)
         return ReviewTarget(sessionID: sessionID, agent: session.agent, reviews: runner.reviews,
+                            authorModel: author.model, authorEffort: author.effort,
                             executable: { [runner] in runner.executable(for: $0) },
                             isBusy: { [runner] in runner.state(sessionID).isBusy },
                             send: { [runner, store] in runner.send($0, sessionID: sessionID, store: store) },

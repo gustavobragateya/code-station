@@ -6,7 +6,7 @@ struct SecondOpinionLaunchTests {
     @Test func codexListsServersInTheReviewDirectoryAndDisablesThemBeforeRunning() async throws {
         let scratch = ScratchDirectory(prefix: "second-opinion")
         let executable = try agent(in: scratch, listing: #"[{"name":"files","enabled":true,"transport":{"command":"files-server"}},{"name":"remote","enabled":true,"transport":{"url":"https://example.com/mcp"}}]"#)
-        let result = await SecondOpinion.review([], agent: .codex, executable: executable,
+        let result = await SecondOpinion.review([], reviewer: .init(agent: .codex), executable: executable,
                                                 searchPath: "/usr/bin:/bin", repositories: [
                                                     (root: scratch.url.path, name: "App"),
                                                     (root: "/attached/project", name: "API")
@@ -31,7 +31,7 @@ struct SecondOpinionLaunchTests {
         default: "invalid JSON"
         }
         let executable = try agent(in: scratch, listing: listing, status: failure == "command failed" ? 1 : 0)
-        let result = await SecondOpinion.review([], agent: .codex, executable: executable,
+        let result = await SecondOpinion.review([], reviewer: .init(agent: .codex), executable: executable,
                                                 searchPath: "/usr/bin:/bin",
                                                 repositories: [(root: scratch.url.path, name: "App")])
         #expect(result == .failure(.init(message: "Could not list Codex's MCP servers to disable them.")))
@@ -41,7 +41,7 @@ struct SecondOpinionLaunchTests {
     @Test func codexCanReviewWhenNoServersAreConfigured() async throws {
         let scratch = ScratchDirectory(prefix: "second-opinion")
         let executable = try agent(in: scratch, listing: "[]")
-        let result = await SecondOpinion.review([], agent: .codex, executable: executable,
+        let result = await SecondOpinion.review([], reviewer: .init(agent: .codex), executable: executable,
                                                 searchPath: "/usr/bin:/bin",
                                                 repositories: [(root: scratch.url.path, name: "App")])
         #expect(result == .success([]))
