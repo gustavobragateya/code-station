@@ -188,43 +188,6 @@ struct MobileAccessTests {
         #expect(prompt == RemoteCommand(type: .sendPrompt, prompt: "Run the tests"))
     }
 
-    // The whole of what a QR code is allowed to reach, since every command from the phone
-    // is checked against it.
-    @Test func aSessionCodeReachesOnlyItsOwnSession() {
-        let projectID = UUID()
-        let mine = ChatSession(projectID: projectID, agent: .claudeCode)
-        let other = ChatSession(projectID: projectID, agent: .claudeCode)
-        let scope = MobileScope.session(mine.id)
-
-        #expect(scope.allows(mine))
-        #expect(!scope.allows(other))
-        #expect(!scope.allows(project: projectID))
-        #expect(!scope.canBrowse)
-        #expect(!scope.canCreate)
-    }
-
-    @Test func aProjectCodeReachesEverySessionInThatProject() {
-        let projectID = UUID()
-        let elsewhere = UUID()
-        let scope = MobileScope.project(projectID)
-
-        #expect(scope.allows(ChatSession(projectID: projectID, agent: .claudeCode)))
-        #expect(!scope.allows(ChatSession(projectID: elsewhere, agent: .claudeCode)))
-        #expect(scope.allows(project: projectID))
-        #expect(!scope.allows(project: elsewhere))
-        #expect(scope.canBrowse)
-        #expect(scope.canCreate)
-    }
-
-    @Test func theWholeAppCodeReachesEveryProject() {
-        let scope = MobileScope.everything
-
-        #expect(scope.allows(ChatSession(projectID: UUID(), agent: .claudeCode)))
-        #expect(scope.allows(project: UUID()))
-        #expect(scope.canBrowse)
-        #expect(scope.canCreate)
-    }
-
     @Test func decodesTheCommandsThatMoveAroundTheApp() throws {
         let sessionID = UUID()
         let projectID = UUID()

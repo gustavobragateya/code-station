@@ -69,7 +69,7 @@ struct SidebarBrandBar: View {
     @Environment(MobileAccessController.self) private var mobileAccess
     @State private var hovering = false
 
-    private var phone: SidebarPhoneStatus? { SidebarPhoneStatus(mobileAccess.activeShares) }
+    private var phone: SidebarPhoneStatus? { SidebarPhoneStatus(mobileAccess.share) }
 
     var body: some View {
         Button(action: selectHome) {
@@ -152,35 +152,23 @@ struct SidebarBrandBar: View {
     }
 }
 
-// What the brand bar says about the codes that are out. A share counts as on the phone
-// once a phone has joined it; until then it is only shared.
+// What the brand bar says about the code that is out. It counts as on the phone once a
+// phone has joined it; until then it is only shared.
 struct SidebarPhoneStatus: Equatable {
-    let shared: Int
-    let connected: Int
+    let isConnected: Bool
 
-    init?(_ shares: [MobileShareSummary]) {
-        self.init(shared: shares.count, connected: shares.count(where: \.isConnected))
+    init?(_ share: MobileShare?) {
+        guard let share else { return nil }
+        isConnected = share.isConnected
     }
 
-    init?(shared: Int, connected: Int) {
-        guard shared > 0 else { return nil }
-        self.shared = shared
-        self.connected = connected
+    init(isConnected: Bool) {
+        self.isConnected = isConnected
     }
 
-    var isConnected: Bool { connected > 0 }
+    var text: String { isConnected ? "On phone" : "Shared" }
 
-    var text: String {
-        guard isConnected else { return "\(shared) shared" }
-        return connected == shared ? "\(connected) on phone" : "\(connected) of \(shared) on phone"
-    }
-
-    var spoken: String {
-        guard isConnected else { return "\(shared) shared with a phone, none connected" }
-        return connected == shared
-            ? "\(connected) shared with a connected phone"
-            : "\(connected) of \(shared) shared with a connected phone"
-    }
+    var spoken: String { isConnected ? "shared with a connected phone" : "shared with a phone, none connected" }
 }
 
 // Permission prompts and turns that ended while the user was away are the only things in

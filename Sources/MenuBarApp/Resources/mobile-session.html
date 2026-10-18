@@ -773,7 +773,7 @@
       <button class="connection" type="button"><span id="list-light" class="light" aria-hidden="true"></span><span class="connection-label">Connecting…</span></button>
     </header>
     <main id="directory-scroll"><div class="directory-content">
-      <div class="intro"><div><h1>Your sessions</h1><p>Pick up where you left off on your Mac.</p></div><div class="intro-actions"><span id="scope"></span><button id="new-session" class="new remote" type="button" hidden>New session</button></div></div>
+      <div class="intro"><div><h1>Your sessions</h1><p>Pick up where you left off on your Mac.</p></div><div class="intro-actions"><span id="scope">All projects shared</span><button id="new-session" class="new remote" type="button">New session</button></div></div>
       <div class="toolbar"><nav class="filters" aria-label="Filter sessions">
         <button class="pill active" data-filter="all" aria-pressed="true">All</button>
         <button class="pill" data-filter="wait" aria-pressed="false">Needs you</button>
@@ -787,7 +787,7 @@
 
   <div id="session" class="screen" hidden>
     <header>
-      <button id="back" type="button" aria-label="Back to the list" hidden>‹</button>
+      <button id="back" type="button" aria-label="Back to the list">‹</button>
       <div class="head-copy">
         <div id="title" class="head-title">Connecting…</div>
         <div id="where" class="head-where">Teya Code Station</div>
@@ -877,7 +877,7 @@
       let activeSessionID;
       const drafts = new Map();
       let conversation = 'main';
-      let scopeLabel = '';
+      const scopeLabel = 'All projects shared';
       let filter = 'all';
       let query = '';
       let infoSheet;
@@ -897,7 +897,7 @@
       let screen = 'directory';
       // The list as the Mac last described it, so the new-session sheet can name the
       // project it is about without asking for it again.
-      let listing = { title: '', canCreate: false, projects: [] };
+      let listing = { projects: [] };
       // Keep expansion and see-more choices while directory updates arrive.
       const sessionLimit = 4;
       const expandedProjects = new Set();
@@ -1151,18 +1151,15 @@
 
       const renderDirectory = payload => {
         listing = payload;
-        find('new-session').hidden = !payload.canCreate;
         find('new-session').disabled = !authenticated || !payload.projects.some(project => !project.isMissing);
         listTitle.textContent = 'Code Station';
-        scopeLabel = payload.scope;
-        find('scope').textContent = scopeLabel;
         const sessions = payload.projects.reduce((count, p) => count + p.sessions.length, 0);
         const running = payload.projects.reduce((count, p) =>
           count + p.sessions.filter(s => s.state === 'RUNNING').length, 0);
         const waiting = payload.projects.reduce((count, p) =>
           count + p.sessions.filter(s => s.state === 'NEEDS YOU').length, 0);
-        listWhere.textContent = payload.scope;
-        document.title = `${payload.title} · Code Station`;
+        listWhere.textContent = scopeLabel;
+        document.title = 'Code Station';
 
         for (const project of payload.projects) {
           if (!knownProjects.has(project.id)) expandedProjects.add(project.id);
@@ -1563,13 +1560,11 @@
         conversation = snapshot.conversation || 'main';
         prompt.value = drafts.get(`${activeSessionID}:${conversation}`) || '';
         prompt.style.height = '';
-        scopeLabel = snapshot.scope;
         find('conversation-tab').textContent = conversation === 'design' ? 'Conversation (back to main)' : 'Conversation';
         find('conversation-target').hidden = conversation !== 'design';
         find('conversation-target').textContent = 'Design conversation · Messages go to the companion Design session';
         prompt.setAttribute('aria-label', conversation === 'design' ? 'Message the Design conversation' : 'Message this session');
         prompt.placeholder = conversation === 'design' ? 'Message the Design conversation…' : 'Message this session…';
-        back.hidden = !snapshot.canBrowse;
         queuedPrompts = snapshot.queued || [];
         renderHeader(snapshot.header);
         model.clear();
@@ -2022,7 +2017,7 @@
         }
       });
       document.querySelectorAll('.connection').forEach(node => node.addEventListener('click', () =>
-        showInfo(authenticated ? 'Connected to your Mac' : 'Connection unavailable', [scopeLabel || 'Waiting for authentication.',
+        showInfo(authenticated ? 'Connected to your Mac' : 'Connection unavailable', [authenticated ? scopeLabel : 'Waiting for authentication.',
           'Keep your Mac awake and both devices on the same trusted Wi-Fi.',
           pairingEnded ? 'Scan a fresh code from phone sharing on your Mac.' : 'Sessions run on your Mac. Your draft stays here if the connection drops.'])));
       document.querySelectorAll('[data-filter]').forEach(node => node.addEventListener('click', () => {

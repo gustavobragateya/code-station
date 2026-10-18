@@ -1,44 +1,23 @@
 import SwiftUI
 
-// The desktop side of mobile access: the button that hands out a code, the badge that
-// says how many are out, and the sheet that shows one.
+// The desktop side of mobile access: the button that hands out the code and the dialog
+// that shows it.
 
-// The dialog behind the QR button, kept apart from it so a header that folds its actions
-// into a menu opens the same thing without drawing the button.
+// The dialog behind the Home phone pill, kept apart from it so the pills on the Home map
+// open the same thing.
 @MainActor
 enum MobilePairing {
-    static func open(scope: MobileScope, dialogs: DialogPresenter, store: ProjectStore) {
+    static func open(dialogs: DialogPresenter) {
         dialogs.show(Dialog(
-            title: title(scope, store: store),
+            title: "Open Code Station on your phone",
             message: """
-            \(reach(scope, store: store))
+            A phone on the same trusted Wi-Fi can read any session in any project, start new ones anywhere, send prompts, stop turns and answer requests.
 
             No phone can connect until you start sharing below. Sharing continues after this dialog closes. Reopen it to cancel or stop sharing.
             """,
-            content: AnyView(MobilePairingView(scope: scope)),
+            content: AnyView(MobilePairingView()),
             actions: [.init(label: "Done", kind: .primary)],
             width: 390))
-    }
-
-    private static func title(_ scope: MobileScope, store: ProjectStore) -> String {
-        switch scope {
-        case .session: "Open this session on your phone"
-        case .project(let id): "Open \(store.project(id)?.name ?? "this project") on your phone"
-        case .everything: "Open Code Station on your phone"
-        }
-    }
-
-    // What the code lets the phone do, said plainly, because it is the whole difference
-    // between the three codes.
-    private static func reach(_ scope: MobileScope, store: ProjectStore) -> String {
-        switch scope {
-        case .session:
-            "A phone on the same trusted Wi-Fi can read this one session, send prompts, stop turns and answer requests. It can reach nothing else."
-        case .project(let id):
-            "A phone on the same trusted Wi-Fi can read any session in \(store.project(id)?.name ?? "this project"), start new ones there, send prompts, stop turns and answer requests."
-        case .everything:
-            "A phone on the same trusted Wi-Fi can read any session in any project, start new ones anywhere, send prompts, stop turns and answer requests."
-        }
     }
 }
 
@@ -81,19 +60,18 @@ enum PhoneLink: Equatable {
     }
 }
 
-// The phone pill on the Home header, the one place a code is handed out. Every code
-// reaches the whole app, so a phone is either in on everything or on nothing.
+// The phone pill on the Home header, the one place a code is handed out. The code reaches
+// the whole app, so a phone is either in on everything or on nothing.
 struct MobileAccessButton: View {
     @Environment(MobileAccessController.self) private var mobileAccess
     @Environment(DialogPresenter.self) private var dialogs
-    @Environment(ProjectStore.self) private var store
 
     var body: some View {
-        let shared = mobileAccess.share(for: .everything) != nil
-        let connected = mobileAccess.isLive(.everything)
+        let shared = mobileAccess.share != nil
+        let connected = mobileAccess.share?.isConnected == true
         PhonePill(link: .of(shared: shared, connected: connected),
                   label: tooltip(shared: shared, connected: connected)) {
-            MobilePairing.open(scope: .everything, dialogs: dialogs, store: store)
+            MobilePairing.open(dialogs: dialogs)
         }
     }
 
@@ -242,7 +220,6 @@ struct MobilePairingView: View {
     }
 
     @Environment(MobileAccessController.self) private var mobileAccess
-    let scope: MobileScope
 
     @State private var starting = false
     @State private var confirming = false
@@ -250,7 +227,7 @@ struct MobilePairingView: View {
 
     var body: some View {
         Group {
-            if let share = mobileAccess.share(for: scope) {
+            if let share = mobileAccess.share {
                 VStack(spacing: 14) {
                     if let image = MobilePairingQRCode.image(for: share.url) {
                         Image(nsImage: image)
@@ -263,10 +240,9 @@ struct MobilePairingView: View {
 
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(mobileAccess.isLive(scope) ? Theme.addition : Color.secondary)
+                            .fill(share.isConnected ? Theme.addition : Color.secondary)
                             .frame(width: 7, height: 7)
-                        Text(mobileAccess.isLive(scope)
-                             ? "Phone connected" : "Waiting for the phone")
+                        Text(share.isConnected ? "Phone connected" : "Waiting for the phone")
                             .font(.system(size: 12, weight: .semibold))
                     }
 
@@ -279,7 +255,7 @@ struct MobilePairingView: View {
 
                     ActionButton(title: share.isConnected ? "Stop sharing" : "Cancel sharing",
                                  tone: .danger, height: 38, size: 13, fills: true) {
-                        mobileAccess.revoke(scope)
+                        mobileAccess.revoke()
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -328,8 +304,8 @@ struct MobilePairingView: View {
         .padding(.top, 12)
     }
 
-    // A code that can browse hands over more than the screen the button was pressed on, so
-    // that reach is spelled out once more and has to be agreed to before the code exists.
+    // The code hands over every project, so that reach is spelled out once more and has to
+    // be agreed to before the code exists.
     private var confirmation: some View {
         VStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle")
@@ -341,7 +317,7 @@ struct MobilePairingView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(warning)
+                Text("Whoever scans it can browse every project, read any session and start new ones anywhere, all running on this Mac. Only scan it on a phone you trust.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -360,29 +336,16 @@ struct MobilePairingView: View {
         .padding(.top, 12)
     }
 
-    private var warning: String {
-        switch scope {
-        case .project:
-            "Whoever scans it can browse every session in this project, read what they say and start new ones that run on this Mac. Only scan it on a phone you trust."
-        default:
-            "Whoever scans it can browse every project, read any session and start new ones anywhere, all running on this Mac. Only scan it on a phone you trust."
-        }
-    }
-
     private var contentState: ContentState {
-        if mobileAccess.share(for: scope) != nil { return .sharing }
+        if mobileAccess.share != nil { return .sharing }
         if confirming { return .confirming }
         return .idle(hasFailure: failure != nil)
     }
 
     private func startSharing() {
         guard !starting else { return }
-        guard !scope.canBrowse else {
-            failure = nil
-            confirming = true
-            return
-        }
-        begin()
+        failure = nil
+        confirming = true
     }
 
     private func begin() {
@@ -393,7 +356,7 @@ struct MobilePairingView: View {
         Task { @MainActor in
             defer { starting = false }
             do {
-                _ = try await mobileAccess.startSharing(scope)
+                _ = try await mobileAccess.startSharing()
             } catch let error as LANServerFailure {
                 failure = error.message
             } catch {

@@ -1,25 +1,18 @@
 import SwiftUI
 
-// One QR code that is out, as the orbit tells it: whether a phone has picked it up, what it
-// can reach and which session it has open. Kept apart from the views so the words can be
-// checked without drawing anything.
-struct OrbitPhoneLink: Identifiable, Equatable {
-    let id: UUID
-    let scope: MobileScope
-    // The project or session the code was made for, or nothing for the whole app.
-    let name: String?
+// The code that is out, as the orbit tells it: whether a phone has picked it up and which
+// session it has open. Kept apart from the views so the words can be checked without
+// drawing anything.
+struct OrbitPhoneLink: Equatable {
     let connected: Bool
     // The session the phone is reading and its title, when it has one open.
     let openSession: UUID?
     let openTitle: String?
 
-    init(share: MobileShareSummary, openTitle: String?) {
-        id = share.id
-        scope = share.scope
-        name = if case .everything = share.scope { nil } else { share.name }
-        connected = share.isConnected
-        openSession = share.isConnected ? share.openSession : nil
-        self.openTitle = openSession == nil ? nil : openTitle
+    init(connected: Bool, openSession: UUID?, openTitle: String?) {
+        self.connected = connected
+        self.openSession = connected ? openSession : nil
+        self.openTitle = self.openSession == nil ? nil : openTitle
     }
 
     var link: PhoneLink { connected ? .connected : .waiting }
@@ -29,12 +22,8 @@ struct OrbitPhoneLink: Identifiable, Equatable {
     // The second line in three parts, so the name can stand out from the words around it.
     var reach: (lead: String, name: String, tail: String) {
         if let openTitle { return ("Open on ", openTitle, "") }
-        if connected {
-            guard let name else { return ("Can reach ", "every project", "") }
-            return ("Can reach ", name, " only")
-        }
-        guard let name else { return ("Code is out for every project", "", "") }
-        return ("Code is out for ", name, "")
+        if connected { return ("Can reach ", "every project", "") }
+        return ("Code is out for every project", "", "")
     }
 
     var reachText: String {
@@ -42,47 +31,30 @@ struct OrbitPhoneLink: Identifiable, Equatable {
         return reach.lead + reach.name + reach.tail
     }
 
-    var tooltip: String {
-        guard let name else { return "Reaches every project" }
-        return "Reaches \(name) only"
-    }
-
+    static let tooltip = "Reaches every project"
     static let action = "Show the code or stop sharing"
 
     var accessibilityLabel: String { "\(state). \(reachText). \(Self.action)." }
 }
 
-// What the phones light on the map. A phone on a session lights the path from the ring to
-// that session; a phone on a project code that is not on a session lights the whole project.
+// What the phone lights on the map: the path from the ring to the session it has open.
 struct OrbitPhoneReach: Equatable {
     var wires: Set<String> = []
-    var tiles: Set<UUID> = []
     var sessions: Set<UUID> = []
 
     init() {}
 
-    init(links: [OrbitPhoneLink], map: HomeWorkMap) {
-        for link in links where link.connected {
-            if case .project(let project) = link.scope {
-                let groups = map.active.filter { $0.session.projectID == project }.map(\.containerID)
-                tiles.formUnion(groups)
-            }
-            if let open = link.openSession {
-                sessions.insert(open)
-                if let live = map.active.first(where: { $0.id == open }) {
-                    wires.formUnion(["hub:\(live.containerID)", "session:\(live.id)"])
-                }
-            } else if case .project(let project) = link.scope {
-                for live in map.active where live.session.projectID == project {
-                    wires.formUnion(["hub:\(live.containerID)", "session:\(live.id)"])
-                }
-            }
+    init(link: OrbitPhoneLink?, map: HomeWorkMap) {
+        guard let open = link?.openSession else { return }
+        sessions.insert(open)
+        if let live = map.active.first(where: { $0.id == open }) {
+            wires.formUnion(["hub:\(live.containerID)", "session:\(live.id)"])
         }
     }
 }
 
-// The pill above the ring for one code. It opens the same dialog as the QR button, where the
-// code can be shown again or taken back.
+// The pill above the ring for the code that is out. It opens the same dialog as the Home
+// phone pill, where the code can be shown again or taken back.
 struct OrbitPhoneBeacon: View {
     let link: OrbitPhoneLink
     let reachWidth: CGFloat
@@ -130,7 +102,7 @@ struct OrbitPhoneBeacon: View {
         .onHover { hovering = $0 }
         .motion(Motion.hover, value: hovering)
         .appTooltip(delay: .zero) {
-            Tooltip(title: link.tooltip, subtitle: OrbitPhoneLink.action)
+            Tooltip(title: OrbitPhoneLink.tooltip, subtitle: OrbitPhoneLink.action)
         }
         .accessibilityLabel(link.accessibilityLabel)
     }

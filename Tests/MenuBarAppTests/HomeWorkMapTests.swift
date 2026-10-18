@@ -168,65 +168,38 @@ struct HomeWorkMapTests {
         expectNoOverlaps(banded)
     }
 
-    private func share(_ scope: MobileScope, name: String = "AB Testing", connected: Bool,
-                       open: UUID? = nil) -> MobileShareSummary {
-        MobileShareSummary(id: UUID(), scope: scope, name: name, isConnected: connected, openSession: open)
-    }
+    @Test func phonePillSaysWhetherAPhoneJoinedAndWhereItIs() {
+        let waiting = OrbitPhoneLink(connected: false, openSession: nil, openTitle: nil)
+        #expect(waiting.state == "Waiting for phone")
+        #expect(waiting.reachText == "Code is out for every project")
 
-    @Test func phonePillSaysWhatTheCodeReachesAndWhereThePhoneIs() {
-        let waitingAll = OrbitPhoneLink(share: share(.everything, name: "All projects", connected: false),
-                                        openTitle: nil)
-        #expect(waitingAll.state == "Waiting for phone")
-        #expect(waitingAll.reachText == "Code is out for every project")
-        #expect(waitingAll.tooltip == "Reaches every project")
+        let connected = OrbitPhoneLink(connected: true, openSession: nil, openTitle: nil)
+        #expect(connected.state == "Phone connected")
+        #expect(connected.reachText == "Can reach every project")
 
-        let waitingProject = OrbitPhoneLink(share: share(.project(UUID()), connected: false), openTitle: nil)
-        #expect(waitingProject.reachText == "Code is out for AB Testing")
-
-        let connectedAll = OrbitPhoneLink(share: share(.everything, name: "All projects", connected: true),
-                                          openTitle: nil)
-        #expect(connectedAll.state == "Phone connected")
-        #expect(connectedAll.reachText == "Can reach every project")
-
-        let connectedProject = OrbitPhoneLink(share: share(.project(UUID()), connected: true), openTitle: nil)
-        #expect(connectedProject.reachText == "Can reach AB Testing only")
-        #expect(connectedProject.tooltip == "Reaches AB Testing only")
-
-        let reading = OrbitPhoneLink(share: share(.everything, connected: true, open: UUID()),
-                                     openTitle: "Fix the share sheet")
+        let reading = OrbitPhoneLink(connected: true, openSession: UUID(), openTitle: "Fix the share sheet")
         #expect(reading.reachText == "Open on Fix the share sheet")
         #expect(reading.accessibilityLabel
                 == "Phone connected. Open on Fix the share sheet. Show the code or stop sharing.")
 
         // A session the code still remembers from a phone that dropped is not where a phone is now.
-        let dropped = OrbitPhoneLink(share: share(.everything, connected: false, open: UUID()),
-                                     openTitle: "Fix the share sheet")
+        let dropped = OrbitPhoneLink(connected: false, openSession: UUID(), openTitle: "Fix the share sheet")
         #expect(dropped.openSession == nil)
         #expect(dropped.reachText == "Code is out for every project")
     }
 
-    @Test func aConnectedPhoneLightsThePathToWhatItReaches() {
-        let project = UUID()
-        let first = live(project: project)
-        let second = live(project: project)
+    @Test func aConnectedPhoneLightsThePathToTheSessionItHasOpen() {
         let other = live()
-        let map = HomeWorkMap(sessions: [first, second, other])
+        let map = HomeWorkMap(sessions: [live(), other])
 
-        let reading = OrbitPhoneLink(share: share(.everything, connected: true, open: other.id),
-                                     openTitle: "Other")
-        let onSession = OrbitPhoneReach(links: [reading], map: map)
+        let reading = OrbitPhoneLink(connected: true, openSession: other.id, openTitle: "Other")
+        let onSession = OrbitPhoneReach(link: reading, map: map)
         #expect(onSession.wires == ["hub:\(other.containerID)", "session:\(other.id)"])
         #expect(onSession.sessions == [other.id])
-        #expect(onSession.tiles.isEmpty)
 
-        let projectCode = OrbitPhoneLink(share: share(.project(project), connected: true), openTitle: nil)
-        let onProject = OrbitPhoneReach(links: [projectCode], map: map)
-        #expect(onProject.tiles == [project])
-        #expect(onProject.wires == ["hub:\(project)", "session:\(first.id)", "session:\(second.id)"])
-        #expect(onProject.sessions.isEmpty)
-
-        let waiting = OrbitPhoneLink(share: share(.project(project), connected: false), openTitle: nil)
-        #expect(OrbitPhoneReach(links: [waiting], map: map) == OrbitPhoneReach())
+        let onList = OrbitPhoneLink(connected: true, openSession: nil, openTitle: nil)
+        #expect(OrbitPhoneReach(link: onList, map: map) == OrbitPhoneReach())
+        #expect(OrbitPhoneReach(link: nil, map: map) == OrbitPhoneReach())
     }
 
     private func tile(_ node: OrbitLayout.Node) -> CGRect {

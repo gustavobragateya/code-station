@@ -376,7 +376,7 @@ struct OrbitMap: View {
     @State private var selected: UUID?
     @State private var cardHeight: CGFloat = 240
     @State private var pointed: OrbitSpotlight?
-    @State private var beaconFrames: [UUID: CGRect] = [:]
+    @State private var beaconFrame: CGRect?
     @State private var ripples = 0
     // False only until a map that opens has appeared. Everything on the map reads it,
     // each part with its own delay, so the opening is one change played in order.
@@ -400,10 +400,10 @@ struct OrbitMap: View {
     }
 
     var body: some View {
-        let phones = phoneLinks
-        let layout = OrbitLayout(map: map, width: width, phoneBand: phones.isEmpty ? 0 : OrbitLayout.phoneBand)
+        let phone = phoneLink
+        let layout = OrbitLayout(map: map, width: width, phoneBand: phone == nil ? 0 : OrbitLayout.phoneBand)
         let opening = OrbitOpening(layout: layout)
-        let reach = OrbitPhoneReach(links: phones, map: map)
+        let reach = OrbitPhoneReach(link: phone, map: map)
         // Pointing at a project in the sidebar lights it here too.
         let spotlight = pointed ?? store.navigation.pointedSidebarItem.map(OrbitSpotlight.project)
         ZStack(alignment: .topLeading) {
@@ -414,7 +414,12 @@ struct OrbitMap: View {
             OrbitWires(wires: layout.wires, built: built, opening: opening, spotlight: spotlight,
                        phoneLit: reach.wires)
 
-            phoneSignals(phones, layout: layout)
+            if let phone, let beaconFrame {
+                OrbitPhoneSignal(link: phone.link, start: CGPoint(x: beaconFrame.midX, y: beaconFrame.maxY + 2),
+                                 end: layout.ringTop)
+                    .frame(width: layout.size.width, height: layout.size.height)
+                    .transition(.opacity)
+            }
 
             OrbitPhoneRipple(trigger: ripples)
                 .position(layout.hub)
@@ -425,7 +430,7 @@ struct OrbitMap: View {
 
             ForEach(Array(layout.nodes.enumerated()), id: \.element.id) { index, node in
                 let group = node.group
-                OrbitProjectTile(group: group, built: built, reached: reach.tiles.contains(group.id),
+                OrbitProjectTile(group: group, built: built,
                                  entrance: step(opening.tile(index), OrbitOpening.pop)) {
                     reveal(group)
                 } point: { point(.project(group.id), at: $0) }
@@ -463,7 +468,9 @@ struct OrbitMap: View {
                     .opacity(OrbitSpotlight.opacity(spotlight, group: more.group.id))
             }
 
-            beacons(phones, layout: layout)
+            if let phone {
+                beacon(phone, layout: layout)
+            }
 
             if let selected, let live = map.active.first(where: { $0.id == selected }) {
                 card(for: live, in: layout)
@@ -473,8 +480,8 @@ struct OrbitMap: View {
         .coordinateSpace(.named(Self.space))
         .motion(HomeWorkMapView.reflow, value: layout.motionKey)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: spotlight)
-        .animation(reduceMotion ? nil : Self.drop, value: phones)
-        .onChange(of: phones.contains(where: \.connected)) { _, now in
+        .animation(reduceMotion ? nil : Self.drop, value: phone)
+        .onChange(of: phone?.connected == true) { _, now in
             if now && !reduceMotion { ripples += 1 }
         }
         .onExitCommand { selected = nil }
@@ -487,47 +494,28 @@ struct OrbitMap: View {
     nonisolated private static let space = "orbit"
     private static let drop = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.55)
 
-    private var phoneLinks: [OrbitPhoneLink] {
-        mobileAccess.activeShares.map { share in
-            OrbitPhoneLink(share: share, openTitle: share.openSession.flatMap { store.session($0)?.title })
-        }
+    private var phoneLink: OrbitPhoneLink? {
+        guard let share = mobileAccess.share else { return nil }
+        let open = mobileAccess.openSession
+        return OrbitPhoneLink(connected: share.isConnected, openSession: open,
+                              openTitle: open.flatMap { store.session($0)?.title })
     }
 
-    // One pill for every code that is out, side by side above the ring.
-    private func beacons(_ phones: [OrbitPhoneLink], layout: OrbitLayout) -> some View {
-        let gap: CGFloat = 10
-        // The second line gives way first when the pills would run past the map.
-        let each = (layout.size.width - 40 - gap * CGFloat(max(phones.count - 1, 0))) / CGFloat(max(phones.count, 1))
-        let reachWidth = min(280, max(80, each - 100))
-        return HStack(spacing: gap) {
-            ForEach(phones) { phone in
-                OrbitPhoneBeacon(link: phone, reachWidth: reachWidth) {
-                    MobilePairing.open(scope: phone.scope, dialogs: dialogs, store: store)
-                }
-                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Self.space)) } action: {
-                    beaconFrames[phone.id] = $0
-                }
-                .transition(.asymmetric(insertion: .offset(y: -14).combined(with: .opacity),
-                                        removal: .offset(y: -12).combined(with: .opacity)))
-            }
+    // The pill for the code that is out, above the ring. The line from it always goes into
+    // the top of the ring; running one straight to a session would cross the pills between.
+    private func beacon(_ phone: OrbitPhoneLink, layout: OrbitLayout) -> some View {
+        // The second line gives way first when the pill would run past the map.
+        let reachWidth = min(280, max(80, layout.size.width - 140))
+        return OrbitPhoneBeacon(link: phone, reachWidth: reachWidth) {
+            MobilePairing.open(dialogs: dialogs)
+        }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Self.space)) } action: {
+            beaconFrame = $0
         }
         .frame(width: layout.size.width, height: OrbitPhoneBeacon.height)
         .position(x: layout.hub.x, y: OrbitPhoneBeacon.height / 2 + 2)
-    }
-
-    // Every line goes into the top of the ring, whatever the code can reach. Running one
-    // straight to a session would cross the pills between.
-    private func phoneSignals(_ phones: [OrbitPhoneLink], layout: OrbitLayout) -> some View {
-        ZStack {
-            ForEach(phones) { phone in
-                if let frame = beaconFrames[phone.id] {
-                    OrbitPhoneSignal(link: phone.link, start: CGPoint(x: frame.midX, y: frame.maxY + 2),
-                                     end: layout.ringTop)
-                        .transition(.opacity)
-                }
-            }
-        }
-        .frame(width: layout.size.width, height: layout.size.height)
+        .transition(.asymmetric(insertion: .offset(y: -14).combined(with: .opacity),
+                                removal: .offset(y: -12).combined(with: .opacity)))
     }
 
     // A part of the opening, or nothing when motion is reduced and the map simply appears.
@@ -924,8 +912,6 @@ struct HubArc: Shape {
 private struct OrbitTileFace: View {
     let group: HomeWorkMap.Group
     let hovering: Bool
-    // A connected phone can reach this project, and nothing past it.
-    var reached = false
 
     var body: some View {
         let identity = group.identity
@@ -935,8 +921,7 @@ private struct OrbitTileFace: View {
             .background {
                 halo
                     .fill(Theme.card)
-                    .overlay(halo.stroke(reached ? Theme.dotOn : hovering ? identity.tint.colour.opacity(0.5) : Theme.hairline,
-                                         lineWidth: reached ? 2 : 1))
+                    .overlay(halo.stroke(hovering ? identity.tint.colour.opacity(0.5) : Theme.hairline))
                     .padding(-6)
             }
     }
@@ -947,7 +932,6 @@ private struct OrbitTileFace: View {
 private struct OrbitProjectTile: View {
     let group: HomeWorkMap.Group
     let built: Bool
-    let reached: Bool
     let entrance: Animation?
     let action: () -> Void
     let point: (Bool) -> Void
@@ -958,7 +942,7 @@ private struct OrbitProjectTile: View {
         let identity = group.identity
         let halo = RoundedRectangle(cornerRadius: 19)
         Button(action: action) {
-            OrbitTileFace(group: group, hovering: hovering, reached: reached)
+            OrbitTileFace(group: group, hovering: hovering)
                 .contentShape(halo.inset(by: -6))
                 // The pop is drawn inside the button, so the button itself is never scaled.
                 .scaleEffect(built ? 1 : 0.55)
@@ -970,8 +954,7 @@ private struct OrbitProjectTile: View {
             hovering = $0
             point($0)
         }
-        .accessibilityLabel("\(identity.containerName), \(counted(group.sessions.count, "session"))"
-                            + (reached ? ", reached from a phone" : ""))
+        .accessibilityLabel("\(identity.containerName), \(counted(group.sessions.count, "session"))")
         .accessibilityHint("Shows \(identity.containerName) in the sidebar")
     }
 }

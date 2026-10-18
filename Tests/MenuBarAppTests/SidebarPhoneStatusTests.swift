@@ -5,42 +5,34 @@ import Testing
 // the app, so it has to tell a joined phone apart from a code nobody has used yet.
 @MainActor
 struct SidebarPhoneStatusTests {
-    @Test func noSharesShowNoLine() {
-        #expect(SidebarPhoneStatus(shared: 0, connected: 0) == nil)
+    @Test func noCodeShowsNoLine() {
+        #expect(SidebarPhoneStatus(nil) == nil)
     }
 
-    @Test func aCodeNobodyJoinedIsOnlyShared() throws {
-        let status = try #require(SidebarPhoneStatus(shared: 3, connected: 0))
+    @Test func aCodeNobodyJoinedIsOnlyShared() {
+        let status = SidebarPhoneStatus(isConnected: false)
 
-        #expect(!status.isConnected)
-        #expect(status.text == "3 shared")
+        #expect(status.text == "Shared")
     }
 
-    @Test func everyShareJoinedReadsAsOnPhone() throws {
-        let status = try #require(SidebarPhoneStatus(shared: 1, connected: 1))
+    @Test func aJoinedCodeReadsAsOnPhone() {
+        let status = SidebarPhoneStatus(isConnected: true)
 
-        #expect(status.isConnected)
-        #expect(status.text == "1 on phone")
-    }
-
-    @Test func someSharesJoinedSayHowManyOfAll() throws {
-        let status = try #require(SidebarPhoneStatus(shared: 3, connected: 1))
-
-        #expect(status.text == "1 of 3 on phone")
+        #expect(status.text == "On phone")
     }
 
     @Test func homeButtonSpeaksBothLines() {
         let value = SidebarBrandBar.accessibilityValue(
-            runningCount: 3, phone: SidebarPhoneStatus(shared: 1, connected: 1))
+            runningCount: 3, phone: SidebarPhoneStatus(isConnected: true))
 
-        #expect(value == "3 running sessions, 1 shared with a connected phone")
+        #expect(value == "3 running sessions, shared with a connected phone")
     }
 
     @Test func homeButtonSpeaksThePhoneAloneWhenNothingRuns() {
         let value = SidebarBrandBar.accessibilityValue(
-            runningCount: 0, phone: SidebarPhoneStatus(shared: 2, connected: 0))
+            runningCount: 0, phone: SidebarPhoneStatus(isConnected: false))
 
-        #expect(value == "2 shared with a phone, none connected")
+        #expect(value == "shared with a phone, none connected")
     }
 
     @Test func homeButtonSaysNothingWhenIdle() {
